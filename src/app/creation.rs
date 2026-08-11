@@ -517,6 +517,39 @@ impl App {
     }
 
     pub(crate) fn session_summary(&self) -> crate::protocol::SessionSummary {
+        let sidebar = (self.state.view.layout == crate::app::state::ViewLayout::Desktop
+            && !self.state.sidebar_collapsed
+            && self.state.view.sidebar_rect.width > 0)
+            .then(|| {
+                let (spaces, _) = crate::ui::expanded_sidebar_sections(
+                    self.state.view.sidebar_rect,
+                    self.state.sidebar_section_split,
+                );
+                let workspace_cards = self
+                    .state
+                    .view
+                    .workspace_card_areas
+                    .iter()
+                    .filter_map(|card| {
+                        self.state.workspaces.get(card.ws_idx).map(|workspace| {
+                            crate::protocol::SessionWorkspaceCardSummary {
+                                workspace_id: workspace.id.clone(),
+                                x: card.rect.x,
+                                y: card.rect.y,
+                                width: card.rect.width,
+                                height: card.rect.height,
+                            }
+                        })
+                    })
+                    .collect();
+                crate::protocol::SessionSidebarSummary {
+                    width: self.state.view.sidebar_rect.width,
+                    spaces_y: spaces.y,
+                    spaces_height: spaces.height,
+                    footer_y: self.state.sidebar_new_button_rect().y,
+                    workspace_cards,
+                }
+            });
         crate::protocol::SessionSummary {
             workspaces: self
                 .state
@@ -533,6 +566,7 @@ impl App {
                     }
                 })
                 .collect(),
+            sidebar,
         }
     }
 }

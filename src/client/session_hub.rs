@@ -9,21 +9,18 @@ use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::api::schema::AgentStatus;
 use crate::ipc::LocalStream;
 use crate::protocol::{
     ClientInputEvent, ClientKeybindings, ClientLaunchMode, ClientMessage, ClientMouseKind,
-    FrameData, RenderEncoding, ServerMessage, SessionSummary, MAX_FRAME_SIZE,
-    MAX_RENDER_FRAME_SIZE,
+    FrameData, RenderEncoding, ServerMessage, SessionSidebarSummary, SessionSummary,
+    MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE,
 };
 
 use super::{ClientError, ClientLoopEvent};
-
-const MAX_SIDEBAR_WIDTH: u16 = 30;
-const MIN_CONTENT_WIDTH: u16 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteSessionDescriptor {
@@ -66,6 +63,9 @@ enum HubRowTarget {
         session: String,
         workspace_id: String,
     },
+    ActiveSidebarRow {
+        original_y: u16,
+    },
     NewSession,
 }
 
@@ -97,15 +97,33 @@ struct HubState {
 }
 
 impl HubState {
+    fn active_summary(&self) -> Option<&SessionSummary> {
+        self.sessions
+            .iter()
+            .find(|session| session.name == self.active.name)
+            .and_then(|session| session.summary.as_ref())
+    }
+
+    fn sidebar_layout(&self) -> Option<&SessionSidebarSummary> {
+        self.active_summary()?.sidebar.as_ref()
+    }
+
     fn sidebar_width(&self) -> u16 {
-        sidebar_width(self.cols)
+        self.sidebar_layout().map_or(0, |layout| layout.width)
     }
 
     fn rows(&self) -> Vec<HubRow> {
+        let Some(layout) = self.sidebar_layout() else {
+            return Vec::new();
+        };
         let mut rows = Vec::new();
-        let mut y = 1_u16;
+        let mut y = layout.spaces_y.saturating_add(1);
+        let new_session_y = layout
+            .footer_y
+            .min(layout.spaces_y.saturating_add(layout.spaces_height))
+            .saturating_sub(1);
         for session in &self.sessions {
-            if y >= self.rows.saturating_sub(2) {
+            if y >= new_session_y {
                 break;
             }
             rows.push(HubRow {
@@ -116,9 +134,26 @@ impl HubState {
             if self.collapsed.contains(&session.name) {
                 continue;
             }
+            if session.name == self.active.name {
+                for card in &layout.workspace_cards {
+                    for offset in 0..card.height {
+                        if y >= new_session_y {
+                            break;
+                        }
+                        rows.push(HubRow {
+                            y,
+                            target: HubRowTarget::ActiveSidebarRow {
+                                original_y: card.y.saturating_add(offset),
+                            },
+                        });
+                        y = y.saturating_add(1);
+                    }
+                }
+                continue;
+            }
             if let Some(summary) = &session.summary {
                 for workspace in &summary.workspaces {
-                    if y >= self.rows.saturating_sub(2) {
+                    if y >= new_session_y {
                         break;
                     }
                     rows.push(HubRow {
@@ -132,9 +167,9 @@ impl HubState {
                 }
             }
         }
-        if y < self.rows {
+        if new_session_y > layout.spaces_y && new_session_y < self.rows {
             rows.push(HubRow {
-                y,
+                y: new_session_y,
                 target: HubRowTarget::NewSession,
             });
         }
@@ -236,9 +271,14 @@ pub(crate) fn run_remote_session_hub(
             summary_stream: None,
         })
         .collect::<Vec<_>>();
+    let collapsed = sessions
+        .iter()
+        .filter(|session| session.name != initial_session)
+        .map(|session| session.name.clone())
+        .collect();
     let mut state = HubState {
         sessions,
-        collapsed: HashSet::new(),
+        collapsed,
         active,
         next_generation,
         modal: None,
@@ -369,7 +409,7 @@ async fn run_hub_loop(
                 state.repaint = true;
                 state.full_repaint = true;
                 let message = ClientMessage::Resize {
-                    cols: content_width(cols),
+                    cols,
                     rows,
                     cell_width_px: 0,
                     cell_height_px: 0,
@@ -514,18 +554,37 @@ fn handle_local_input(
 
     if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
         if mouse.column < state.sidebar_width() {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let target = state
-                    .rows()
-                    .into_iter()
-                    .find(|row| row.y == mouse.row)
-                    .map(|row| row.target);
-                if let Some(target) = target {
-                    activate_row(backend, state, event_tx, should_quit, target)?;
-                    return Ok(true);
+            let target = state
+                .rows()
+                .into_iter()
+                .find(|row| row.y == mouse.row)
+                .map(|row| row.target);
+            match target {
+                Some(HubRowTarget::ActiveSidebarRow { original_y }) => {
+                    let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
+                        return Ok(false);
+                    };
+                    let message = ClientMessage::InputEvents {
+                        events: vec![ClientInputEvent::Mouse {
+                            kind,
+                            column: mouse.column,
+                            row: original_y,
+                            modifiers: mouse.modifiers.bits(),
+                        }],
+                    };
+                    super::write_to_server(&mut state.active.stream, &message)
+                        .map_err(ClientError::ConnectionLost)?;
+                    return Ok(false);
                 }
+                Some(target) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        activate_row(backend, state, event_tx, should_quit, target)?;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                None => {}
             }
-            return Ok(false);
         }
 
         let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
@@ -534,7 +593,7 @@ fn handle_local_input(
         let message = ClientMessage::InputEvents {
             events: vec![ClientInputEvent::Mouse {
                 kind,
-                column: mouse.column.saturating_sub(state.sidebar_width()),
+                column: mouse.column,
                 row: mouse.row,
                 modifiers: mouse.modifiers.bits(),
             }],
@@ -725,6 +784,7 @@ fn activate_row(
             }
             state.status = None;
         }
+        HubRowTarget::ActiveSidebarRow { .. } => {}
         HubRowTarget::NewSession => {
             state.modal = Some(NewSessionModal::default());
         }
@@ -833,13 +893,13 @@ fn connect_active(
     let mut stream = backend.connect_client(session)?;
     super::do_handshake_with_options(
         &mut stream,
-        content_width(cols),
+        cols,
         rows,
         0,
         0,
         RenderEncoding::SemanticFrame,
         keybindings.clone(),
-        ClientLaunchMode::AppEmbedded,
+        ClientLaunchMode::App,
         super::REMOTE_HANDSHAKE_READ_TIMEOUT,
     )
     .map_err(io::Error::other)?;
@@ -913,133 +973,169 @@ fn render_hub(
 }
 
 fn compose_frame(state: &HubState) -> FrameData {
-    let area = Rect::new(0, 0, state.cols, state.rows);
-    let sidebar_width = state.sidebar_width();
-    let mut buffer = Buffer::empty(area);
-    let heading = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    buffer.set_string(1, 0, "sessions", heading);
-    if sidebar_width > 0 {
-        let divider_x = sidebar_width.saturating_sub(1);
-        for y in 0..state.rows {
-            buffer[(divider_x, y)]
-                .set_symbol("│")
-                .set_style(Style::default().fg(Color::DarkGray));
-        }
+    let Some(original) = state.active.frame.as_ref() else {
+        return FrameData::from_ratatui_buffer_with_hyperlinks(
+            &Buffer::empty(Rect::new(0, 0, state.cols, state.rows)),
+            None,
+            &[],
+        );
+    };
+    let mut frame = original.clone();
+    let Some(layout) = state.sidebar_layout() else {
+        return frame;
+    };
+    let sidebar_width = layout.width.min(frame.width);
+    let body_start = layout.spaces_y.saturating_add(1);
+    let body_end = layout.footer_y.min(frame.height);
+    let blank = original
+        .cells
+        .get(body_start as usize * original.width as usize)
+        .cloned()
+        .or_else(|| original.cells.first().cloned())
+        .unwrap_or_else(|| crate::protocol::CellData {
+            symbol: " ".to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        });
+    let heading = original
+        .cells
+        .get(layout.spaces_y as usize * original.width as usize + 1)
+        .cloned()
+        .unwrap_or_else(|| blank.clone());
+
+    for y in body_start..body_end {
+        fill_frame_row(&mut frame, y, sidebar_width.saturating_sub(1), &blank);
     }
 
-    let rows = state.rows();
-    for row in &rows {
-        match &row.target {
+    for row in state.rows() {
+        match row.target {
             HubRowTarget::Session(name) => {
-                let session = state.sessions.iter().find(|item| &item.name == name);
-                let expanded = !state.collapsed.contains(name);
-                let active = state.active.name == *name;
-                let status = session
-                    .and_then(|item| item.summary.as_ref())
+                let status = state
+                    .sessions
+                    .iter()
+                    .find(|session| session.name == name)
+                    .and_then(|session| session.summary.as_ref())
                     .map(aggregate_status)
                     .unwrap_or(AgentStatus::Unknown);
-                let marker = if expanded { "▼" } else { "▶" };
-                let dot = status_symbol(status);
-                let text = format!(" {marker} {name} {dot}");
-                let style = if active {
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
+                let marker = if state.collapsed.contains(&name) {
+                    "▶"
                 } else {
-                    Style::default().fg(Color::White)
+                    "▼"
                 };
-                fill_row(&mut buffer, row.y, sidebar_width, style);
-                buffer.set_string(0, row.y, clip(&text, sidebar_width as usize), style);
+                write_frame_text(
+                    &mut frame,
+                    0,
+                    row.y,
+                    sidebar_width.saturating_sub(1),
+                    &format!(" {marker} {name} {}", status_symbol(status)),
+                    &heading,
+                );
             }
             HubRowTarget::Workspace {
                 session,
                 workspace_id,
             } => {
-                let workspace = state
+                if let Some(workspace) = state
                     .sessions
                     .iter()
-                    .find(|item| item.name == *session)
+                    .find(|item| item.name == session)
                     .and_then(|item| item.summary.as_ref())
                     .and_then(|summary| {
                         summary
                             .workspaces
                             .iter()
-                            .find(|workspace| workspace.workspace_id == *workspace_id)
-                    });
-                if let Some(workspace) = workspace {
-                    let focused = state.active.name == *session && workspace.focused;
-                    let text = format!(
-                        "   └─ {} {}",
-                        workspace.label,
-                        status_symbol(workspace.agent_status)
+                            .find(|workspace| workspace.workspace_id == workspace_id)
+                    })
+                {
+                    write_frame_text(
+                        &mut frame,
+                        0,
+                        row.y,
+                        sidebar_width.saturating_sub(1),
+                        &format!(
+                            "   └─ {} {}",
+                            workspace.label,
+                            status_symbol(workspace.agent_status)
+                        ),
+                        &blank,
                     );
-                    let style = if focused {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    fill_row(&mut buffer, row.y, sidebar_width, style);
-                    buffer.set_string(0, row.y, clip(&text, sidebar_width as usize), style);
                 }
             }
-            HubRowTarget::NewSession => {
-                buffer.set_string(
-                    1,
+            HubRowTarget::ActiveSidebarRow { original_y } => {
+                copy_frame_row(
+                    original,
+                    &mut frame,
+                    original_y,
                     row.y,
-                    "+ new named session",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                    sidebar_width.saturating_sub(1),
                 );
             }
+            HubRowTarget::NewSession => write_frame_text(
+                &mut frame,
+                1,
+                row.y,
+                sidebar_width.saturating_sub(2),
+                "+ new named session",
+                &heading,
+            ),
         }
-    }
-
-    if let Some(status) = &state.status {
-        let y = state.rows.saturating_sub(1);
-        buffer.set_string(
-            1,
-            y,
-            clip(status, sidebar_width.saturating_sub(2) as usize),
-            Style::default().fg(Color::Yellow),
-        );
-    }
-
-    let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
-    if let Some(content) = &state.active.frame {
-        let content_width = state.cols.saturating_sub(sidebar_width).min(content.width);
-        let content_height = state.rows.min(content.height);
-        for y in 0..content_height {
-            for x in 0..content_width {
-                let source = y as usize * content.width as usize + x as usize;
-                let target = y as usize * state.cols as usize + (sidebar_width + x) as usize;
-                if let (Some(source), Some(target)) =
-                    (content.cells.get(source), frame.cells.get_mut(target))
-                {
-                    *target = source.clone();
-                }
-            }
-        }
-        frame.hyperlinks = content.hyperlinks.clone();
-        frame.cursor = content
-            .cursor
-            .as_ref()
-            .map(|cursor| crate::protocol::CursorState {
-                x: cursor.x.saturating_add(sidebar_width),
-                y: cursor.y,
-                visible: cursor.visible,
-                shape: cursor.shape,
-            });
     }
 
     if let Some(modal) = &state.modal {
         overlay_new_session_modal(&mut frame, modal);
     }
-    frame.graphics.clear();
     frame
+}
+
+fn fill_frame_row(frame: &mut FrameData, y: u16, width: u16, template: &crate::protocol::CellData) {
+    for x in 0..width {
+        let index = y as usize * frame.width as usize + x as usize;
+        if let Some(cell) = frame.cells.get_mut(index) {
+            *cell = template.clone();
+            cell.symbol = " ".to_owned();
+            cell.hyperlink = None;
+        }
+    }
+}
+
+fn write_frame_text(
+    frame: &mut FrameData,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    template: &crate::protocol::CellData,
+) {
+    for (offset, symbol) in text.chars().take(width as usize).enumerate() {
+        let index = y as usize * frame.width as usize + x as usize + offset;
+        if let Some(cell) = frame.cells.get_mut(index) {
+            *cell = template.clone();
+            cell.symbol = symbol.to_string();
+            cell.hyperlink = None;
+        }
+    }
+}
+
+fn copy_frame_row(
+    source: &FrameData,
+    target: &mut FrameData,
+    source_y: u16,
+    target_y: u16,
+    width: u16,
+) {
+    for x in 0..width.min(source.width).min(target.width) {
+        let source_index = source_y as usize * source.width as usize + x as usize;
+        let target_index = target_y as usize * target.width as usize + x as usize;
+        if let (Some(source), Some(target)) = (
+            source.cells.get(source_index),
+            target.cells.get_mut(target_index),
+        ) {
+            *target = source.clone();
+        }
+    }
 }
 
 fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
@@ -1118,12 +1214,6 @@ fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
     });
 }
 
-fn fill_row(buffer: &mut Buffer, y: u16, width: u16, style: Style) {
-    for x in 0..width.saturating_sub(1) {
-        buffer[(x, y)].set_symbol(" ").set_style(style);
-    }
-}
-
 fn aggregate_status(summary: &SessionSummary) -> AgentStatus {
     summary
         .workspaces
@@ -1149,16 +1239,6 @@ fn status_symbol(status: AgentStatus) -> &'static str {
     }
 }
 
-fn sidebar_width(cols: u16) -> u16 {
-    cols.saturating_sub(MIN_CONTENT_WIDTH)
-        .min(MAX_SIDEBAR_WIDTH)
-        .max((cols / 3).min(MAX_SIDEBAR_WIDTH))
-}
-
-fn content_width(cols: u16) -> u16 {
-    cols.saturating_sub(sidebar_width(cols)).max(1)
-}
-
 fn clip(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
@@ -1167,12 +1247,36 @@ fn clip(value: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn labelled_frame(width: u16, height: u16) -> FrameData {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        for y in 0..height {
+            for x in 0..width {
+                let symbol = y.to_string();
+                buffer[(x, y)].set_symbol(&symbol);
+            }
+        }
+        FrameData::from_ratatui_buffer(&buffer, None)
+    }
+
     #[test]
-    fn narrow_terminals_keep_content_visible() {
-        assert_eq!(sidebar_width(30), 10);
-        assert_eq!(content_width(30), 20);
-        assert_eq!(sidebar_width(120), 30);
-        assert_eq!(content_width(120), 90);
+    fn moving_sidebar_rows_preserves_standard_content_columns() {
+        let source = labelled_frame(8, 6);
+        let mut composed = source.clone();
+        let blank = source.cells[0].clone();
+
+        fill_frame_row(&mut composed, 2, 3, &blank);
+        copy_frame_row(&source, &mut composed, 1, 2, 3);
+
+        for x in 0..3 {
+            let x = x as usize;
+            assert_eq!(composed.cells[2 * 8 + x], source.cells[8 + x]);
+        }
+        for y in 0..6 {
+            for x in 3..8 {
+                let index = (y * 8 + x) as usize;
+                assert_eq!(composed.cells[index], source.cells[index]);
+            }
+        }
     }
 
     #[test]
@@ -1192,6 +1296,7 @@ mod tests {
                     agent_status: AgentStatus::Blocked,
                 },
             ],
+            sidebar: None,
         };
         assert_eq!(aggregate_status(&summary), AgentStatus::Blocked);
     }
