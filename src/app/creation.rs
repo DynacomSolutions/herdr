@@ -489,7 +489,7 @@ impl App {
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
     }
 
-    pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
+    pub(crate) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
         let (agg_state, seen) = ws.aggregate_state(&self.state.terminals);
         crate::api::schema::WorkspaceInfo {
@@ -513,6 +513,26 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+        }
+    }
+
+    pub(crate) fn session_summary(&self) -> crate::protocol::SessionSummary {
+        crate::protocol::SessionSummary {
+            workspaces: self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let workspace = self.workspace_info(index);
+                    crate::protocol::SessionWorkspaceSummary {
+                        workspace_id: workspace.workspace_id,
+                        label: workspace.label,
+                        focused: workspace.focused,
+                        agent_status: workspace.agent_status,
+                    }
+                })
+                .collect(),
         }
     }
 }

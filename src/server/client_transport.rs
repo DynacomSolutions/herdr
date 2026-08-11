@@ -314,8 +314,7 @@ pub(crate) enum ServerEvent {
         cell_height_px: u32,
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
-        direct_attach_requested: bool,
-        direct_graphics: bool,
+        launch_mode: ClientLaunchMode,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -561,8 +560,7 @@ pub(crate) fn handle_client_handshake(
         cell_height_px,
         render_encoding,
         keybindings,
-        direct_attach_requested,
-        direct_graphics,
+        launch_mode,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -611,8 +609,7 @@ pub(crate) fn handle_client_handshake(
                 cell_height_px,
                 requested_encoding,
                 keybindings,
-                launch_mode == ClientLaunchMode::TerminalAttach,
-                launch_mode == ClientLaunchMode::AppDirectGraphics,
+                launch_mode,
             )
         }
         _ => {
@@ -675,8 +672,7 @@ pub(crate) fn handle_client_handshake(
         cell_height_px,
         render_encoding,
         keybindings,
-        direct_attach_requested,
-        direct_graphics,
+        launch_mode,
         writer,
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
@@ -1361,8 +1357,7 @@ new_tab = "ctrl+notakey"
                 cell_height_px,
                 render_encoding,
                 keybindings,
-                direct_attach_requested,
-                direct_graphics,
+                launch_mode,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1370,8 +1365,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
-                assert!(!direct_attach_requested);
-                assert!(!direct_graphics);
+                assert_eq!(launch_mode, ClientLaunchMode::App);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1431,11 +1425,11 @@ new_tab = "ctrl+notakey"
             .expect("client connected event")
         {
             ServerEvent::ClientConnected {
-                direct_attach_requested,
+                launch_mode,
                 writer,
                 ..
             } => {
-                assert!(direct_attach_requested);
+                assert_eq!(launch_mode, ClientLaunchMode::TerminalAttach);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1447,6 +1441,59 @@ new_tab = "ctrl+notakey"
             .join()
             .expect("handshake thread join")
             .expect("handshake thread result");
+    }
+
+    #[test]
+    fn handshake_preserves_session_hub_launch_modes() {
+        for launch_mode in [
+            ClientLaunchMode::AppEmbedded,
+            ClientLaunchMode::SessionSummary,
+        ] {
+            let (mut client_stream, server_stream, _path) =
+                local_stream_pair("client-handshake-session-hub");
+            let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+            let should_quit = Arc::new(AtomicBool::new(false));
+            let handshake_quit = should_quit.clone();
+            let handle = std::thread::spawn(move || {
+                handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+            });
+
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    cols: 100,
+                    rows: 30,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    requested_encoding: RenderEncoding::SemanticFrame,
+                    keybindings: ClientKeybindings::Server,
+                    launch_mode,
+                },
+            )
+            .expect("write hello");
+            let _: ServerMessage =
+                protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+
+            match server_event_rx.blocking_recv().expect("client connected") {
+                ServerEvent::ClientConnected {
+                    launch_mode: actual,
+                    writer,
+                    ..
+                } => {
+                    assert_eq!(actual, launch_mode);
+                    drop(writer);
+                }
+                other => panic!("expected ClientConnected, got {other:?}"),
+            }
+
+            drop(client_stream);
+            should_quit.store(true, Ordering::Release);
+            handle
+                .join()
+                .expect("handshake thread join")
+                .expect("handshake thread result");
+        }
     }
 
     #[test]

@@ -1,11 +1,11 @@
 [package]
 name = "herdr"
-version = "0.8.0"
+version = "0.8.0-dynacom.1"
 edition = "2021"
 build = "build.rs"
 description = "terminal workspace manager for AI coding agents"
 license = "Apache-2.0"
-repository = "https://github.com/herdrdev/herdr"
+repository = "https://github.com/DynacomSolutions/herdr"
 homepage = "https://herdr.dev"
 keywords = ["terminal", "tui", "ai", "agents", "multiplexer"]
 categories = ["command-line-utilities"]

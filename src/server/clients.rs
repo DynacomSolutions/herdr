@@ -8,6 +8,8 @@ use crate::server::render_stream::ClientRenderState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
     App,
+    AppEmbedded,
+    SessionSummary,
     TerminalAttach { terminal_id: String },
     TerminalObserve { terminal_id: String },
 }
@@ -53,6 +55,8 @@ pub(crate) struct ClientConnection {
     pub(crate) last_activity: u64,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
+    /// Last workspace summary sent to a lightweight multi-session client.
+    pub(crate) last_session_summary: Option<crate::protocol::SessionSummary>,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
     /// Passive eligibility for audited local Kitty regular-file graphics.
@@ -127,6 +131,7 @@ impl ClientConnection {
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
+            last_session_summary: None,
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             direct_graphics: false,
             pixel_mouse: false,
@@ -167,7 +172,10 @@ impl ClientConnection {
     }
 
     pub(crate) fn is_full_app_client(&self) -> bool {
-        matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+        matches!(
+            self.mode,
+            ClientConnectionMode::App | ClientConnectionMode::AppEmbedded
+        ) && !self.pending_terminal_attach
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {

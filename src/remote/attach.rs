@@ -2,6 +2,8 @@
 
 use super::shell_quote;
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -50,6 +52,7 @@ impl RemoteKeybindings {
         }
     }
 
+    #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -162,17 +165,15 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    let local_socket = local_forward_socket_path(&remote.target, &session_name);
-    let program = std::env::args()
-        .next()
-        .unwrap_or_else(|| "herdr".to_string());
-    let reattach_command = reattach_command(
-        &program,
-        &remote.target,
-        &session_name,
-        remote.keybindings,
-        remote.live_handoff,
-    );
+    #[cfg(unix)]
+    let keybindings = match remote.keybindings {
+        RemoteKeybindings::Local => crate::config::Config::load()
+            .config
+            .local_keybindings_profile_toml()
+            .map(|keys_toml| crate::protocol::ClientKeybindings::Local { keys_toml })
+            .unwrap_or(crate::protocol::ClientKeybindings::Server),
+        RemoteKeybindings::Server => crate::protocol::ClientKeybindings::Server,
+    };
     let manage_ssh_config = crate::config::Config::load()
         .config
         .remote
@@ -187,15 +188,218 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
     )?;
 
-    let _bridge = SshStdioBridge::start(
-        remote.target,
-        prepared_remote.remote_herdr,
-        local_socket.clone(),
-        session_name,
-        remote_ssh.options(),
-    )?;
+    #[cfg(unix)]
+    {
+        let sessions = remote_session_descriptors(&remote_ssh, &prepared_remote.remote_herdr)?;
+        ensure_remote_named_sessions_ready(
+            &remote_ssh,
+            &prepared_remote.remote_herdr,
+            &sessions,
+            prepared_remote.installed_or_replaced,
+            remote.live_handoff,
+        )?;
+        let mut hub = RemoteSessionHub {
+            target: remote.target,
+            ssh: remote_ssh,
+            remote_herdr: prepared_remote.remote_herdr,
+            sessions,
+            bridges: HashMap::new(),
+        };
+        return crate::client::run_remote_session_hub(&mut hub, &session_name, keybindings);
+    }
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    #[cfg(windows)]
+    {
+        let local_socket = local_forward_socket_path(&remote.target, &session_name);
+        let program = std::env::args()
+            .next()
+            .unwrap_or_else(|| "herdr".to_string());
+        let reattach_command = reattach_command(
+            &program,
+            &remote.target,
+            &session_name,
+            remote.keybindings,
+            remote.live_handoff,
+        );
+        let _bridge = SshStdioBridge::start(
+            remote.target,
+            prepared_remote.remote_herdr,
+            local_socket.clone(),
+            session_name,
+            remote_ssh.options(),
+        )?;
+        run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+struct RemoteSessionListResponse {
+    sessions: Vec<crate::session::SessionInfo>,
+}
+
+#[cfg(unix)]
+fn remote_session_descriptors(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<Vec<crate::client::RemoteSessionDescriptor>> {
+    let command = format!("{} session list --json", remote_herdr.shell_path);
+    let output = ssh.user_shell_output(&command)?;
+    if !output.status.success() {
+        return Err(command_failed("remote session discovery failed", &output));
+    }
+    parse_remote_session_descriptors(&output.stdout)
+}
+
+#[cfg(unix)]
+fn parse_remote_session_descriptors(
+    bytes: &[u8],
+) -> io::Result<Vec<crate::client::RemoteSessionDescriptor>> {
+    let response: RemoteSessionListResponse = serde_json::from_slice(bytes)
+        .map_err(|err| io::Error::other(format!("invalid remote session list: {err}")))?;
+    Ok(response
+        .sessions
+        .into_iter()
+        .map(|session| crate::client::RemoteSessionDescriptor {
+            name: session.name,
+            running: session.running,
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn ensure_remote_named_sessions_ready(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    sessions: &[crate::client::RemoteSessionDescriptor],
+    remote_binary_changed: bool,
+    live_handoff_enabled: bool,
+) -> io::Result<()> {
+    for session in sessions.iter().filter(|session| session.running) {
+        let RemoteServerStatus::Running {
+            version,
+            protocol,
+            live_handoff,
+            detached_server_daemon,
+        } = remote_server_status_for_session(ssh, remote_herdr, &session.name)?
+        else {
+            continue;
+        };
+        if remote_server_restart_reason(
+            version.as_deref(),
+            protocol,
+            detached_server_daemon,
+            remote_binary_changed,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        if live_handoff_enabled && live_handoff {
+            live_handoff_remote_session(ssh, remote_herdr, &session.name)?;
+            continue;
+        }
+        return Err(io::Error::other(format!(
+            "named session {} is running an incompatible herdr server; rerun with --handoff to preserve its panes while upgrading it",
+            session.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remote_session_command(remote_herdr: &RemoteHerdr, session: &str, command: &str) -> String {
+    let mut full = remote_herdr.shell_path.clone();
+    if session != crate::session::DEFAULT_SESSION_NAME {
+        full.push_str(" --session ");
+        full.push_str(&shell_quote(session));
+    }
+    full.push(' ');
+    full.push_str(command);
+    full
+}
+
+#[cfg(unix)]
+struct RemoteSessionHub {
+    target: String,
+    ssh: RemoteSsh,
+    remote_herdr: RemoteHerdr,
+    sessions: Vec<crate::client::RemoteSessionDescriptor>,
+    bridges: HashMap<String, SshStdioBridge>,
+}
+
+#[cfg(unix)]
+impl RemoteSessionHub {
+    fn ensure_bridge(&mut self, session: &str) -> io::Result<PathBuf> {
+        if let Some(bridge) = self.bridges.get(session) {
+            return Ok(bridge.local_socket.clone());
+        }
+        let local_socket = local_forward_socket_path(&self.target, session);
+        let bridge = SshStdioBridge::start(
+            self.target.clone(),
+            self.remote_herdr.clone(),
+            local_socket.clone(),
+            session.to_owned(),
+            self.ssh.options(),
+        )?;
+        self.bridges.insert(session.to_owned(), bridge);
+        Ok(local_socket)
+    }
+
+    fn session_command(&self, session: &str, command: &str) -> String {
+        remote_session_command(&self.remote_herdr, session, command)
+    }
+}
+
+#[cfg(unix)]
+impl crate::client::SessionHubBackend for RemoteSessionHub {
+    fn sessions(&self) -> &[crate::client::RemoteSessionDescriptor] {
+        &self.sessions
+    }
+
+    fn connect_client(&mut self, session: &str) -> io::Result<crate::ipc::LocalStream> {
+        let socket = self.ensure_bridge(session)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::ipc::connect_local_stream(&socket) {
+                Ok(stream) => return Ok(stream),
+                Err(err) if Instant::now() < deadline => {
+                    tracing::debug!(%err, %session, "waiting for session bridge");
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn focus_workspace(&self, session: &str, workspace_id: &str) -> io::Result<()> {
+        let command = self.session_command(
+            session,
+            &format!("workspace focus {}", shell_quote(workspace_id)),
+        );
+        let output = self.ssh.user_shell_output(&command)?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(command_failed("remote workspace focus failed", &output))
+        }
+    }
+
+    fn create_session(&mut self, session: &str) -> io::Result<()> {
+        crate::session::parse_target_name(session).map_err(io::Error::other)?;
+        if self.sessions.iter().any(|item| item.name == session) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {session} already exists"),
+            ));
+        }
+        self.ensure_bridge(session)?;
+        self.sessions.push(crate::client::RemoteSessionDescriptor {
+            name: session.to_owned(),
+            running: true,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1214,7 +1418,15 @@ fn remote_server_status(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<RemoteServerStatus> {
-    let command = format!("{} status server --json", remote_herdr.shell_path);
+    remote_server_status_for_session(ssh, remote_herdr, crate::session::DEFAULT_SESSION_NAME)
+}
+
+fn remote_server_status_for_session(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session: &str,
+) -> io::Result<RemoteServerStatus> {
+    let command = remote_session_command(remote_herdr, session, "status server --json");
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
@@ -1347,21 +1559,29 @@ fn confirm_remote_server_stop(
 }
 
 fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
-    let command = format!(
-        "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
-        remote_herdr.shell_path,
+    live_handoff_remote_session(ssh, remote_herdr, crate::session::DEFAULT_SESSION_NAME)
+}
+
+fn live_handoff_remote_session(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session: &str,
+) -> io::Result<()> {
+    let args = format!(
+        "server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
         remote_herdr.shell_path,
         CURRENT_PROTOCOL,
         current_version()
     );
+    let command = remote_session_command(remote_herdr, session, &args);
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
     }
 
     eprintln!(
-        "handed off the remote herdr server on {}; reconnecting to the prepared server.",
-        ssh.target()
+        "handed off named session {session} on {}; reconnecting to the prepared server.",
+        ssh.target(),
     );
     Ok(())
 }
@@ -1624,6 +1844,7 @@ fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> Stri
     command
 }
 
+#[cfg(test)]
 fn reattach_command(
     program: &str,
     target: &str,
@@ -1706,16 +1927,23 @@ impl SshStdioBridge {
                                 continue;
                             }
                         };
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_herdr,
-                            &session_name,
-                            thread_ssh_options.as_ref(),
-                            &thread_stop,
-                        ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
-                        }
+                        let connection_target = target.clone();
+                        let connection_herdr = remote_herdr.clone();
+                        let connection_session = session_name.clone();
+                        let connection_ssh_options = thread_ssh_options.clone();
+                        let connection_stop = Arc::clone(&thread_stop);
+                        thread::spawn(move || {
+                            if let Err(err) = bridge_connection(
+                                stream,
+                                &connection_target,
+                                &connection_herdr,
+                                &connection_session,
+                                connection_ssh_options.as_ref(),
+                                &connection_stop,
+                            ) {
+                                eprintln!("herdr: remote bridge failed: {err}");
+                            }
+                        });
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
@@ -2141,7 +2369,6 @@ fn run_client_process(
         ))
     }
 }
-
 fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
@@ -2190,6 +2417,44 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn parses_named_sessions_reported_by_remote_gateway() {
+        let sessions = parse_remote_session_descriptors(
+            br#"{"sessions":[{"name":"default","default":true,"running":true,"socket_path":"/tmp/default","session_dir":"/tmp/default-dir"},{"name":"client-a","default":false,"running":false,"socket_path":"/tmp/client-a","session_dir":"/tmp/client-a-dir"}]}"#,
+        )
+        .expect("parse session list");
+
+        assert_eq!(
+            sessions,
+            vec![
+                crate::client::RemoteSessionDescriptor {
+                    name: "default".into(),
+                    running: true,
+                },
+                crate::client::RemoteSessionDescriptor {
+                    name: "client-a".into(),
+                    running: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scopes_remote_commands_to_named_session() {
+        let remote = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_session_command(&remote, "default", "status server --json"),
+            "\"$HOME/.local/bin/herdr\" status server --json"
+        );
+        assert_eq!(
+            remote_session_command(&remote, "client work", "status server --json"),
+            "\"$HOME/.local/bin/herdr\" --session 'client work' status server --json"
+        );
+    }
+
     #[test]
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;

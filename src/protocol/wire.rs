@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -72,6 +72,10 @@ pub enum ClientLaunchMode {
     App,
     /// Full app client eligible for audited local direct graphics.
     AppDirectGraphics,
+    /// Full app client rendered without Herdr's server-owned sidebar.
+    AppEmbedded,
+    /// Lightweight client that receives workspace summaries instead of frames.
+    SessionSummary,
     /// Direct terminal attach client.
     TerminalAttach,
 }
@@ -231,7 +235,6 @@ impl ClientKeyCode {
 }
 
 impl ClientMouseButton {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(button: crossterm::event::MouseButton) -> Self {
         match button {
             crossterm::event::MouseButton::Left => Self::Left,
@@ -250,7 +253,6 @@ impl ClientMouseButton {
 }
 
 impl ClientMouseKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::MouseEventKind) -> Option<Self> {
         use crossterm::event::MouseEventKind;
         Some(match kind {
@@ -625,6 +627,21 @@ impl CompressedFrame {
     }
 }
 
+/// Lightweight workspace state used by a multi-session navigation client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspaceSummary {
+    pub workspace_id: String,
+    pub label: String,
+    pub focused: bool,
+    pub agent_status: crate::api::schema::AgentStatus,
+}
+
+/// Current workspace inventory for one named Herdr session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub workspaces: Vec<SessionWorkspaceSummary>,
+}
+
 impl FrameData {
     /// Creates a `FrameData` from a ratatui `Buffer` and optional cursor.
     ///
@@ -758,6 +775,9 @@ pub enum ServerMessage {
 
     /// A rendered frame to be displayed by a semantic-frame client.
     Frame(FrameData),
+
+    /// Lightweight workspace inventory for a session-summary client.
+    SessionSummary(SessionSummary),
 
     /// Terminal bytes to write directly for a terminal-ANSI client.
     Terminal(TerminalFrame),
