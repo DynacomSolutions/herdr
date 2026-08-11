@@ -275,9 +275,10 @@ fn ensure_remote_named_sessions_ready(
     remote_binary_changed: bool,
     live_handoff_enabled: bool,
 ) -> io::Result<()> {
-    for session in sessions.iter().filter(|session| {
-        session.running && session.name != crate::session::DEFAULT_SESSION_NAME
-    }) {
+    for session in sessions
+        .iter()
+        .filter(|session| session.running && session.name != crate::session::DEFAULT_SESSION_NAME)
+    {
         let RemoteServerStatus::Running {
             version,
             protocol,
