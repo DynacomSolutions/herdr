@@ -1073,7 +1073,7 @@ fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Res
         "test -x {0} && {0} --version && {0} status client --json",
         remote_herdr.shell_path
     );
-    let output = ssh.sh_output(&command)?;
+    let output = ssh.user_shell_output(&command)?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -1427,7 +1427,7 @@ fn remote_server_status_for_session(
     session: &str,
 ) -> io::Result<RemoteServerStatus> {
     let command = remote_session_command(remote_herdr, session, "status server --json");
-    let output = ssh.sh_output(&command)?;
+    let output = ssh.user_shell_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
     }
@@ -1574,7 +1574,7 @@ fn live_handoff_remote_session(
         current_version()
     );
     let command = remote_session_command(remote_herdr, session, &args);
-    let output = ssh.sh_output(&command)?;
+    let output = ssh.user_shell_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
     }
@@ -1588,7 +1588,7 @@ fn live_handoff_remote_session(
 
 fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let command = format!("{} server stop", remote_herdr.shell_path);
-    let output = ssh.sh_output(&command)?;
+    let output = ssh.user_shell_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
