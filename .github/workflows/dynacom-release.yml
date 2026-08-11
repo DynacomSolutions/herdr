@@ -100,7 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: write
+      contents: read
 
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b408e7a40e8e0b5a5461e7c # v8
@@ -108,19 +108,13 @@ jobs:
       - name: Generate checksums
         run: sha256sum herdr-*/herdr-* > SHA256SUMS
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+      - name: Publish release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          body: |
-            Dynacom Herdr session hub release.
-
-            - Discovers named sessions through one SSH gateway.
-            - Shows `named session -> workspace` as collapsible sidebar trees.
-            - Switches workspaces and sessions without leaving the interface.
-            - Creates named sessions from `+ new named session`.
-            - Preserves local/server remote keybinding selection and local image paste.
-            - Supports live handoff of all running named sessions with `--handoff`.
-          files: |
+          name: herdr-${{ github.ref_name }}
+          retention-days: 90
+          compression-level: 0
+          path: |
             herdr-linux-x86_64/herdr-linux-x86_64
             herdr-linux-aarch64/herdr-linux-aarch64
             herdr-macos-x86_64/herdr-macos-x86_64
