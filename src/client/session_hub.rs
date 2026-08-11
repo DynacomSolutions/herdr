@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::io::{self, Write as _};
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +16,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     ClientInputEvent, ClientKeybindings, ClientLaunchMode, ClientMessage, ClientMouseKind,
-    FrameData, RenderEncoding, ServerMessage, SessionContextMenuSummary, SessionSidebarSummary,
-    SessionSummary, MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE,
+    FrameData, RenderEncoding, ServerMessage, SessionSidebarSummary, SessionSummary,
+    MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE,
 };
 
 use super::{ClientError, ClientLoopEvent};
@@ -34,6 +35,127 @@ pub(crate) trait SessionHubBackend {
     fn create_session(&mut self, session: &str) -> io::Result<()>;
     fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()>;
     fn close_session(&mut self, session: &str) -> io::Result<()>;
+}
+
+struct LocalSessionHub {
+    sessions: Vec<RemoteSessionDescriptor>,
+}
+
+impl LocalSessionHub {
+    fn discover() -> io::Result<Self> {
+        let sessions = crate::session::list_sessions()?
+            .into_iter()
+            .map(|session| RemoteSessionDescriptor {
+                name: session.name,
+                running: session.running,
+            })
+            .collect();
+        Ok(Self { sessions })
+    }
+
+    fn session_name(name: &str) -> Option<&str> {
+        (name != crate::session::DEFAULT_SESSION_NAME).then_some(name)
+    }
+
+    fn client_socket(name: &str) -> std::path::PathBuf {
+        crate::session::client_socket_path_for(Self::session_name(name))
+    }
+
+    fn start_server(name: &str) -> io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let mut command = Command::new(exe);
+        if name != crate::session::DEFAULT_SESSION_NAME {
+            command.arg("--session").arg(name);
+        }
+        command
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::platform::detach_server_daemon_command(&mut command);
+        crate::platform::launch_server_daemon_command(&mut command)?;
+        crate::server::autodetect::wait_for_server_socket(
+            &Self::client_socket(name),
+            Duration::from_secs(10),
+        )
+    }
+
+    fn run_scoped(name: &str, args: &[&str]) -> io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let mut command = Command::new(exe);
+        if name != crate::session::DEFAULT_SESSION_NAME {
+            command.arg("--session").arg(name);
+        }
+        let output = command.args(args).output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            Err(io::Error::other(if message.is_empty() {
+                format!("session command exited with {}", output.status)
+            } else {
+                message
+            }))
+        }
+    }
+}
+
+impl SessionHubBackend for LocalSessionHub {
+    fn sessions(&self) -> &[RemoteSessionDescriptor] {
+        &self.sessions
+    }
+
+    fn connect_client(&mut self, session: &str) -> io::Result<LocalStream> {
+        let socket = Self::client_socket(session);
+        if let Ok(stream) = crate::ipc::connect_local_stream(&socket) {
+            return Ok(stream);
+        }
+        Self::start_server(session)?;
+        crate::ipc::connect_local_stream(&socket)
+    }
+
+    fn focus_workspace(&self, session: &str, workspace_id: &str) -> io::Result<()> {
+        Self::run_scoped(session, &["workspace", "focus", workspace_id])
+    }
+
+    fn create_session(&mut self, session: &str) -> io::Result<()> {
+        crate::session::parse_target_name(session).map_err(io::Error::other)?;
+        if self.sessions.iter().any(|item| item.name == session) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {session} already exists"),
+            ));
+        }
+        Self::start_server(session)?;
+        self.sessions.push(RemoteSessionDescriptor {
+            name: session.to_owned(),
+            running: true,
+        });
+        Ok(())
+    }
+
+    fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()> {
+        crate::session::rename_session(session, new_name).map_err(io::Error::other)?;
+        if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
+            item.name = new_name.to_owned();
+            item.running = false;
+        }
+        Ok(())
+    }
+
+    fn close_session(&mut self, session: &str) -> io::Result<()> {
+        if self
+            .sessions
+            .iter()
+            .find(|item| item.name == session)
+            .is_some_and(|item| item.running)
+        {
+            crate::session::stop_session(Self::session_name(session)).map_err(io::Error::other)?;
+        }
+        crate::session::delete_session(session).map_err(io::Error::other)?;
+        self.sessions.retain(|item| item.name != session);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +244,6 @@ struct HubState {
     remote_image_paste_key: Option<(crossterm::event::KeyCode, KeyModifiers)>,
     server_overlay_session: Option<String>,
     server_overlay_seen: bool,
-    server_overlay_base_frame: Option<FrameData>,
 }
 
 impl HubState {
@@ -262,29 +383,9 @@ impl HubState {
             .find(|session| session.name == name)
             .and_then(|session| session.sidebar_frame.as_ref())
     }
-
-    fn session_summary(&self, name: &str) -> Option<&SessionSummary> {
-        self.sessions
-            .iter()
-            .find(|session| session.name == name)
-            .and_then(|session| session.summary.as_ref())
-    }
-
-    fn displayed_server_context_menu(
-        &self,
-        session: &str,
-    ) -> Option<(SessionContextMenuSummary, Rect)> {
-        let source = self.session_summary(session)?.context_menu?;
-        let target = place_overlay_beside_sidebar(
-            self.cols,
-            self.rows,
-            self.sidebar_width(),
-            Rect::new(source.x, source.y, source.width, source.height),
-        );
-        Some((source, target))
-    }
 }
 
+#[cfg(any())]
 pub(crate) fn run_remote_session_hub(
     backend: &mut impl SessionHubBackend,
     initial_session: &str,
@@ -303,6 +404,64 @@ pub(crate) fn run_remote_session_hub(
     };
     let (cols, rows, _, _, _) = super::initial_terminal_geometry(false);
 
+    let mut state = create_hub_state(
+        backend,
+        initial_session,
+        keybindings,
+        cols,
+        rows,
+        remote_image_paste_key,
+    )?;
+
+    let terminal_guard = super::setup_terminal(mouse_capture).map_err(|err| {
+        eprintln!("herdr: failed to set up terminal: {err}");
+        err
+    })?;
+    let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
+    let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        super::restore_terminal_state(
+            panic_resets_modify_other_keys,
+            panic_resets_host_color_scheme_reports,
+        );
+        original_hook(info);
+    }));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let quit_flag = should_quit.clone();
+    if let Err(err) = ctrlc::set_handler(move || {
+        quit_flag.store(true, Ordering::Release);
+    }) {
+        tracing::warn!(%err, "failed to install session hub termination handler");
+    }
+
+    let result = rt.block_on(run_hub_loop(
+        backend,
+        &mut state,
+        should_quit,
+        mouse_capture,
+        loaded_config.config.ui.redraw_on_focus_gained,
+    ));
+
+    drop(terminal_guard);
+    rt.shutdown_timeout(Duration::from_millis(100));
+    crate::logging::shutdown("client");
+    result.map_err(io::Error::other)
+}
+
+fn create_hub_state(
+    backend: &mut impl SessionHubBackend,
+    initial_session: &str,
+    keybindings: ClientKeybindings,
+    cols: u16,
+    rows: u16,
+    remote_image_paste_key: Option<(crossterm::event::KeyCode, KeyModifiers)>,
+) -> io::Result<HubState> {
     let mut descriptors = backend.sessions().to_vec();
     if !descriptors
         .iter()
@@ -335,34 +494,6 @@ pub(crate) fn run_remote_session_hub(
         &keybindings,
     )?;
     next_generation = next_generation.saturating_add(1);
-
-    let terminal_guard = super::setup_terminal(mouse_capture).map_err(|err| {
-        eprintln!("herdr: failed to set up terminal: {err}");
-        err
-    })?;
-    let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
-    let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        super::restore_terminal_state(
-            panic_resets_modify_other_keys,
-            panic_resets_host_color_scheme_reports,
-        );
-        original_hook(info);
-    }));
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
-    let should_quit = Arc::new(AtomicBool::new(false));
-    let quit_flag = should_quit.clone();
-    if let Err(err) = ctrlc::set_handler(move || {
-        quit_flag.store(true, Ordering::Release);
-    }) {
-        tracing::warn!(%err, "failed to install session hub termination handler");
-    }
-
     let sessions = descriptors
         .into_iter()
         .map(|descriptor| HubSession {
@@ -397,26 +528,431 @@ pub(crate) fn run_remote_session_hub(
         remote_image_paste_key,
         server_overlay_session: None,
         server_overlay_seen: false,
-        server_overlay_base_frame: None,
     };
     if let Some(session) = state.session_mut(initial_session) {
         session.running = true;
     }
+    Ok(state)
+}
 
-    let result = rt.block_on(run_hub_loop(
-        backend,
-        &mut state,
-        should_quit,
-        mouse_capture,
-        loaded_config.config.ui.redraw_on_focus_gained,
-    ));
+enum HubBridgeInput {
+    Message(ClientMessage),
+    Disconnected,
+}
 
-    drop(terminal_guard);
+pub(crate) fn run_local_session_hub_bridge(initial_session: &str) -> io::Result<()> {
+    super::init_logging();
+    let mut stdin = io::stdin().lock();
+    let hello: ClientMessage = crate::protocol::read_message(&mut stdin, MAX_FRAME_SIZE)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let ClientMessage::Hello {
+        version,
+        cols,
+        rows,
+        keybindings,
+        ..
+    } = hello
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session hub bridge expected Hello",
+        ));
+    };
+    drop(stdin);
+
+    let mut stdout = io::stdout().lock();
+    if let crate::protocol::VersionCheck::Incompatible(error) =
+        crate::protocol::check_client_version(version)
+    {
+        crate::protocol::write_message(
+            &mut stdout,
+            &ServerMessage::Welcome {
+                version: crate::protocol::PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: Some(error),
+            },
+        )
+        .map_err(|err| io::Error::other(err.to_string()))?;
+        return Ok(());
+    }
+    crate::protocol::write_message(
+        &mut stdout,
+        &ServerMessage::Welcome {
+            version: crate::protocol::PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+        },
+    )
+    .map_err(|err| io::Error::other(err.to_string()))?;
+
+    let mut backend = LocalSessionHub::discover()?;
+    let mut state = create_hub_state(&mut backend, initial_session, keybindings, cols, rows, None)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    let result = rt.block_on(run_hub_bridge_loop(&mut backend, &mut state, &mut stdout));
     rt.shutdown_timeout(Duration::from_millis(100));
-    crate::logging::shutdown("client");
+    crate::logging::shutdown("session-hub-bridge");
     result.map_err(io::Error::other)
 }
 
+async fn run_hub_bridge_loop(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    stdout: &mut impl Write,
+) -> Result<(), ClientError> {
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<HubBridgeInput>(64);
+
+    let input_quit = should_quit.clone();
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        while !input_quit.load(Ordering::Acquire) {
+            match crate::protocol::read_message(
+                &mut stdin,
+                crate::protocol::MAX_GRAPHICS_FRAME_SIZE,
+            ) {
+                Ok(message) => {
+                    if input_tx
+                        .blocking_send(HubBridgeInput::Message(message))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(crate::protocol::FramingError::UnexpectedEof) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "session hub bridge input failed");
+                    break;
+                }
+            }
+        }
+        let _ = input_tx.blocking_send(HubBridgeInput::Disconnected);
+    });
+
+    spawn_hub_reader(
+        state
+            .active
+            .stream
+            .try_clone()
+            .map_err(ClientError::ConnectionFailed)?,
+        event_tx.clone(),
+        state.active.name.clone(),
+        state.active.generation,
+        HubStreamKind::App,
+        should_quit.clone(),
+    );
+    let running_sessions = state
+        .sessions
+        .iter()
+        .filter(|session| session.running)
+        .map(|session| session.name.clone())
+        .collect::<Vec<_>>();
+    for session in running_sessions {
+        if let Err(err) = connect_summary(backend, state, &session, &event_tx, should_quit.clone())
+        {
+            state.status = Some(format!("{session}: {err}"));
+        }
+    }
+    write_hub_bridge_frame(state, stdout)?;
+
+    while !should_quit.load(Ordering::Acquire) {
+        tokio::select! {
+            input = input_rx.recv() => {
+                match input.unwrap_or(HubBridgeInput::Disconnected) {
+                    HubBridgeInput::Message(message) => {
+                        if handle_hub_bridge_input(
+                            backend,
+                            state,
+                            &event_tx,
+                            should_quit.clone(),
+                            message,
+                        )? {
+                            state.repaint = true;
+                        }
+                    }
+                    HubBridgeInput::Disconnected => break,
+                }
+            }
+            event = event_rx.recv() => {
+                let Some(event) = event else { break; };
+                handle_hub_bridge_server_event(state, stdout, event)?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+
+        if state.repaint {
+            write_hub_bridge_frame(state, stdout)?;
+        }
+    }
+    should_quit.store(true, Ordering::Release);
+    let _ = super::write_to_server(&mut state.active.stream, &ClientMessage::Detach);
+    Ok(())
+}
+
+fn handle_hub_bridge_input(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    message: ClientMessage,
+) -> Result<bool, ClientError> {
+    match message {
+        ClientMessage::Input { data } => {
+            handle_local_input(backend, state, event_tx, should_quit, data)
+        }
+        ClientMessage::Resize { cols, rows, .. } => {
+            resize_hub_streams(state, cols, rows)?;
+            Ok(true)
+        }
+        ClientMessage::InputEvents { events } => {
+            let target = state
+                .server_overlay_session
+                .clone()
+                .unwrap_or_else(|| state.active.name.clone());
+            write_to_session(state, &target, &ClientMessage::InputEvents { events })?;
+            Ok(false)
+        }
+        ClientMessage::Detach => {
+            should_quit.store(true, Ordering::Release);
+            Ok(false)
+        }
+        ClientMessage::Hello { .. }
+        | ClientMessage::AttachTerminal { .. }
+        | ClientMessage::AttachScroll { .. }
+        | ClientMessage::ObserveTerminal { .. }
+        | ClientMessage::ControlTerminal { .. } => Ok(false),
+        message @ (ClientMessage::ClipboardImage { .. }
+        | ClientMessage::GraphicsTransmissionResult { .. }
+        | ClientMessage::InputPixels { .. }
+        | ClientMessage::GraphicsTransmissionStarted { .. }) => {
+            super::write_to_server(&mut state.active.stream, &message)
+                .map_err(ClientError::ConnectionLost)?;
+            Ok(false)
+        }
+    }
+}
+
+fn resize_hub_streams(state: &mut HubState, cols: u16, rows: u16) -> Result<(), ClientError> {
+    state.cols = cols;
+    state.rows = rows;
+    state.full_repaint = true;
+    let message = ClientMessage::Resize {
+        cols,
+        rows,
+        cell_width_px: 0,
+        cell_height_px: 0,
+    };
+    super::write_to_server(&mut state.active.stream, &message)
+        .map_err(ClientError::ConnectionLost)?;
+    for session in &mut state.sessions {
+        if let Some(stream) = session.sidebar_stream.as_mut() {
+            super::write_to_server(stream, &message).map_err(ClientError::ConnectionLost)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_hub_bridge_server_event(
+    state: &mut HubState,
+    stdout: &mut impl Write,
+    event: ClientLoopEvent,
+) -> Result<(), ClientError> {
+    match event {
+        ClientLoopEvent::HubServerMessage {
+            session,
+            generation,
+            stream_kind,
+            message,
+        } => match stream_kind {
+            HubStreamKind::App
+                if session == state.active.name && generation == state.active.generation =>
+            {
+                handle_active_bridge_message(
+                    state,
+                    stdout,
+                    super::decompress_server_message(message)?,
+                )?;
+            }
+            HubStreamKind::Summary => {
+                apply_hub_summary(state, &session, generation, message);
+            }
+            HubStreamKind::Sidebar => {
+                apply_hub_sidebar_message(state, &session, generation, message)?;
+            }
+            HubStreamKind::App => {}
+        },
+        ClientLoopEvent::HubServerDisconnected {
+            session,
+            generation,
+            stream_kind,
+        } => apply_hub_disconnect(state, &session, generation, stream_kind),
+        ClientLoopEvent::Timer
+        | ClientLoopEvent::StdinInput(_)
+        | ClientLoopEvent::Resize(..)
+        | ClientLoopEvent::ServerMessage(_)
+        | ClientLoopEvent::ServerDisconnected
+        | ClientLoopEvent::PixelMouse(_, _)
+        | ClientLoopEvent::DirectGraphicsResponse(_) => {}
+    }
+    Ok(())
+}
+
+fn handle_active_bridge_message(
+    state: &mut HubState,
+    stdout: &mut impl Write,
+    message: ServerMessage,
+) -> Result<(), ClientError> {
+    match message {
+        ServerMessage::Frame(frame) => {
+            state.active.frame = Some(frame);
+            state.repaint = true;
+        }
+        ServerMessage::ServerShutdown { reason } => {
+            state.status = Some(reason.unwrap_or_else(|| "session stopped".to_owned()));
+            state.active.frame = None;
+            state.repaint = true;
+        }
+        ServerMessage::MouseCapture { enabled, .. } => {
+            write_hub_bridge_message(
+                stdout,
+                &ServerMessage::MouseCapture {
+                    enabled,
+                    sgr_pixels: false,
+                },
+            )?;
+        }
+        ServerMessage::SessionSummary(_)
+        | ServerMessage::Welcome { .. }
+        | ServerMessage::CompressedFrame(_) => {}
+        message => write_hub_bridge_message(stdout, &message)?,
+    }
+    Ok(())
+}
+
+fn apply_hub_summary(state: &mut HubState, session: &str, generation: u64, message: ServerMessage) {
+    let overlay_is_owned = state.server_overlay_session.as_deref() == Some(session);
+    let overlay_was_seen = state.server_overlay_seen;
+    let mut received_overlay_active = None;
+    if let Some(hub_session) = state.session_mut(session) {
+        if generation == hub_session.summary_generation {
+            if let ServerMessage::SessionSummary(summary) = message {
+                received_overlay_active = Some(summary.overlay_active);
+                hub_session.summary = Some(summary);
+                hub_session.running = true;
+                state.repaint = true;
+            }
+        }
+    }
+    if let Some(overlay_active) = received_overlay_active {
+        if overlay_is_owned && overlay_active {
+            state.server_overlay_seen = true;
+        } else if overlay_is_owned && overlay_was_seen && !overlay_active {
+            state.server_overlay_session = None;
+            state.server_overlay_seen = false;
+        } else if state.server_overlay_session.is_none()
+            && session == state.active.name
+            && overlay_active
+        {
+            state.server_overlay_session = Some(session.to_owned());
+            state.server_overlay_seen = true;
+        }
+    }
+}
+
+fn apply_hub_sidebar_message(
+    state: &mut HubState,
+    session: &str,
+    generation: u64,
+    message: ServerMessage,
+) -> Result<(), ClientError> {
+    if let Some(hub_session) = state.session_mut(session) {
+        if generation == hub_session.sidebar_generation {
+            match super::decompress_server_message(message)? {
+                ServerMessage::Frame(frame) => {
+                    hub_session.sidebar_frame = Some(frame);
+                    state.repaint = true;
+                }
+                ServerMessage::ServerShutdown { .. } => {
+                    hub_session.sidebar_frame = None;
+                    hub_session.sidebar_stream = None;
+                    hub_session.running = false;
+                    state.repaint = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_hub_disconnect(
+    state: &mut HubState,
+    session: &str,
+    generation: u64,
+    stream_kind: HubStreamKind,
+) {
+    match stream_kind {
+        HubStreamKind::App
+            if session == state.active.name && generation == state.active.generation =>
+        {
+            state.active.frame = None;
+            state.status = Some(format!("session {session} disconnected"));
+            state.repaint = true;
+        }
+        HubStreamKind::Summary => {
+            if let Some(hub_session) = state.session_mut(session) {
+                if generation == hub_session.summary_generation {
+                    hub_session.summary_stream = None;
+                    hub_session.running = false;
+                    state.repaint = true;
+                }
+            }
+        }
+        HubStreamKind::Sidebar => {
+            if let Some(hub_session) = state.session_mut(session) {
+                if generation == hub_session.sidebar_generation {
+                    hub_session.sidebar_stream = None;
+                    hub_session.sidebar_frame = None;
+                    state.repaint = true;
+                }
+            }
+        }
+        HubStreamKind::App => {}
+    }
+}
+
+fn write_hub_bridge_frame(
+    state: &mut HubState,
+    stdout: &mut impl Write,
+) -> Result<(), ClientError> {
+    let frame = compose_frame(state);
+    let message = if frame.cells.len() >= crate::protocol::SEMANTIC_FRAME_COMPRESSION_CELL_THRESHOLD
+    {
+        ServerMessage::CompressedFrame(
+            crate::protocol::CompressedFrame::encode(&frame)
+                .map_err(|err| ClientError::ConnectionLost(io::Error::other(err.to_string())))?,
+        )
+    } else {
+        ServerMessage::Frame(frame)
+    };
+    write_hub_bridge_message(stdout, &message)?;
+    state.repaint = false;
+    state.full_repaint = false;
+    Ok(())
+}
+
+fn write_hub_bridge_message(
+    stdout: &mut impl Write,
+    message: &ServerMessage,
+) -> Result<(), ClientError> {
+    crate::protocol::write_message(stdout, message)
+        .map_err(|err| ClientError::ConnectionLost(io::Error::other(err.to_string())))
+}
+
+#[cfg(any())]
 async fn run_hub_loop(
     backend: &mut impl SessionHubBackend,
     state: &mut HubState,
@@ -570,14 +1106,12 @@ async fn run_hub_loop(
                         } else if overlay_is_owned && overlay_was_seen && !overlay_active {
                             state.server_overlay_session = None;
                             state.server_overlay_seen = false;
-                            state.server_overlay_base_frame = None;
                         } else if state.server_overlay_session.is_none()
                             && session == state.active.name
                             && overlay_active
                         {
                             state.server_overlay_session = Some(session);
                             state.server_overlay_seen = true;
-                            state.server_overlay_base_frame = state.active.frame.clone();
                         }
                     }
                 }
@@ -650,6 +1184,7 @@ async fn run_hub_loop(
     Ok(())
 }
 
+#[cfg(any())]
 fn handle_active_message(
     state: &mut HubState,
     message: ServerMessage,
@@ -754,6 +1289,7 @@ fn handle_local_input(
                     let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
                         return Ok(false);
                     };
+                    let menu_open = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
                     let message = ClientMessage::InputEvents {
                         events: vec![ClientInputEvent::Mouse {
                             kind,
@@ -763,8 +1299,7 @@ fn handle_local_input(
                         }],
                     };
                     write_to_session(state, &session, &message)?;
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
-                        state.server_overlay_base_frame = state.session_frame(&session).cloned();
+                    if menu_open {
                         state.server_overlay_session = Some(session);
                         state.server_overlay_seen = false;
                     }
@@ -950,15 +1485,14 @@ fn forward_input_to_session(
         let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
             return Ok(());
         };
-        let (column, row) = translate_server_overlay_mouse(state, session, mouse.column, mouse.row);
         return write_to_session(
             state,
             session,
             &ClientMessage::InputEvents {
                 events: vec![ClientInputEvent::Mouse {
                     kind,
-                    column,
-                    row,
+                    column: mouse.column,
+                    row: mouse.row,
                     modifiers: mouse.modifiers.bits(),
                 }],
             },
@@ -1514,6 +2048,7 @@ fn spawn_hub_reader(
     });
 }
 
+#[cfg(any())]
 fn render_hub(
     state: &mut HubState,
     encoder: &mut crate::protocol::render_ansi::BlitEncoder,
@@ -1531,21 +2066,7 @@ fn render_hub(
 }
 
 fn compose_frame(state: &HubState) -> FrameData {
-    let server_context_menu = state
-        .server_overlay_session
-        .as_deref()
-        .and_then(|session| state.displayed_server_context_menu(session));
     let original = match state.server_overlay_session.as_deref() {
-        Some(session) if !state.server_overlay_seen && session == state.active.name => state
-            .server_overlay_base_frame
-            .as_ref()
-            .or(state.active.frame.as_ref()),
-        Some(_) if !state.server_overlay_seen => state.active.frame.as_ref(),
-        Some(session) if server_context_menu.is_some() && session == state.active.name => state
-            .server_overlay_base_frame
-            .as_ref()
-            .or(state.active.frame.as_ref()),
-        Some(_) if server_context_menu.is_some() => state.active.frame.as_ref(),
         Some(session) => state.session_frame(session),
         None => state.active.frame.as_ref(),
     };
@@ -1649,18 +2170,6 @@ fn compose_frame(state: &HubState) -> FrameData {
     if let Some(modal) = &state.modal {
         overlay_session_modal(&mut frame, modal);
     }
-    if let Some(session) = state.server_overlay_session.as_deref() {
-        if let Some((source, target)) = server_context_menu {
-            if let Some(source_frame) = state.session_frame(session) {
-                copy_frame_rect(
-                    source_frame,
-                    &mut frame,
-                    Rect::new(source.x, source.y, source.width, source.height),
-                    target,
-                );
-            }
-        }
-    }
     frame
 }
 
@@ -1669,37 +2178,6 @@ fn place_overlay_beside_sidebar(cols: u16, rows: u16, sidebar_width: u16, source
     let width = source.width.min(cols.saturating_sub(x));
     let height = source.height.min(rows.max(1));
     Rect::new(x, source.y.min(rows.saturating_sub(height)), width, height)
-}
-
-fn translate_server_overlay_mouse(
-    state: &HubState,
-    session: &str,
-    column: u16,
-    row: u16,
-) -> (u16, u16) {
-    let Some((source, target)) = state.displayed_server_context_menu(session) else {
-        return (column, row);
-    };
-    translate_overlay_point(
-        Rect::new(source.x, source.y, source.width, source.height),
-        target,
-        column,
-        row,
-    )
-}
-
-fn translate_overlay_point(source: Rect, target: Rect, column: u16, row: u16) -> (u16, u16) {
-    if column < target.x
-        || column >= target.x.saturating_add(target.width)
-        || row < target.y
-        || row >= target.y.saturating_add(target.height)
-    {
-        return (column, row);
-    }
-    (
-        source.x.saturating_add(column.saturating_sub(target.x)),
-        source.y.saturating_add(row.saturating_sub(target.y)),
-    )
 }
 
 fn fill_frame_row(frame: &mut FrameData, y: u16, width: u16, template: &crate::protocol::CellData) {
@@ -1746,37 +2224,6 @@ fn copy_frame_row(
             target.cells.get_mut(target_index),
         ) {
             *target = source.clone();
-        }
-    }
-}
-
-fn copy_frame_rect(
-    source: &FrameData,
-    target: &mut FrameData,
-    source_rect: Rect,
-    target_rect: Rect,
-) {
-    for y in 0..source_rect.height.min(target_rect.height) {
-        for x in 0..source_rect.width.min(target_rect.width) {
-            let source_x = source_rect.x.saturating_add(x);
-            let source_y = source_rect.y.saturating_add(y);
-            let target_x = target_rect.x.saturating_add(x);
-            let target_y = target_rect.y.saturating_add(y);
-            if source_x >= source.width
-                || source_y >= source.height
-                || target_x >= target.width
-                || target_y >= target.height
-            {
-                continue;
-            }
-            let source_index = source_y as usize * source.width as usize + source_x as usize;
-            let target_index = target_y as usize * target.width as usize + target_x as usize;
-            if let (Some(source), Some(target)) = (
-                source.cells.get(source_index),
-                target.cells.get_mut(target_index),
-            ) {
-                *target = source.clone();
-            }
         }
     }
 }
@@ -1962,14 +2409,5 @@ mod tests {
 
         let narrow_menu = place_overlay_beside_sidebar(40, 20, 28, Rect::new(3, 7, 18, 6));
         assert_eq!(narrow_menu, Rect::new(28, 7, 12, 6));
-    }
-
-    #[test]
-    fn relocated_context_menu_clicks_use_server_coordinates() {
-        let source = Rect::new(3, 7, 18, 6);
-        let target = Rect::new(28, 7, 18, 6);
-
-        assert_eq!(translate_overlay_point(source, target, 30, 9), (5, 9));
-        assert_eq!(translate_overlay_point(source, target, 10, 9), (10, 9));
     }
 }

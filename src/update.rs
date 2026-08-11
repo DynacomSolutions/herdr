@@ -73,6 +73,7 @@ pub struct Version {
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split(['-', '+']).next()?;
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -2374,6 +2375,18 @@ mod tests {
                 major: 0,
                 minor: 1,
                 patch: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_version_with_prerelease_suffix() {
+        assert_eq!(
+            Version::parse("0.8.0-dynacom.9"),
+            Some(Version {
+                major: 0,
+                minor: 8,
+                patch: 0,
             })
         );
     }

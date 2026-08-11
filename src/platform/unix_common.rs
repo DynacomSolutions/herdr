@@ -90,17 +90,14 @@ pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str)
     PathBuf::from("/tmp").join(short_name)
 }
 
-#[cfg(test)]
 pub(crate) fn remote_reattach_program(program: &str) -> String {
     shell_quote(if program.is_empty() { "herdr" } else { program })
 }
 
-#[cfg(test)]
 pub(crate) fn remote_reattach_argument(value: &str) -> String {
     shell_quote(value)
 }
 
-#[cfg(test)]
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {

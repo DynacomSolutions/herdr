@@ -19,7 +19,7 @@ mod input;
 mod session_hub;
 
 #[cfg(unix)]
-pub(crate) use session_hub::{run_remote_session_hub, RemoteSessionDescriptor, SessionHubBackend};
+pub(crate) use session_hub::{run_local_session_hub_bridge, RemoteSessionDescriptor};
 
 use std::collections::HashSet;
 #[cfg(unix)]

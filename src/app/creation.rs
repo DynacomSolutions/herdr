@@ -568,15 +568,6 @@ impl App {
                 .collect(),
             sidebar,
             overlay_active: self.state.mode != crate::app::Mode::Terminal,
-            context_menu: (self.state.mode == crate::app::Mode::ContextMenu)
-                .then(|| self.state.context_menu_rect())
-                .flatten()
-                .map(|rect| crate::protocol::SessionContextMenuSummary {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                }),
         }
     }
 }

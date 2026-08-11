@@ -2,8 +2,6 @@
 
 use super::shell_quote;
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
@@ -52,7 +50,6 @@ impl RemoteKeybindings {
         }
     }
 
-    #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -165,15 +162,6 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    #[cfg(unix)]
-    let keybindings = match remote.keybindings {
-        RemoteKeybindings::Local => crate::config::Config::load()
-            .config
-            .local_keybindings_profile_toml()
-            .map(|keys_toml| crate::protocol::ClientKeybindings::Local { keys_toml })
-            .unwrap_or(crate::protocol::ClientKeybindings::Server),
-        RemoteKeybindings::Server => crate::protocol::ClientKeybindings::Server,
-    };
     let manage_ssh_config = crate::config::Config::load()
         .config
         .remote
@@ -198,14 +186,26 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             prepared_remote.installed_or_replaced,
             remote.live_handoff,
         )?;
-        let mut hub = RemoteSessionHub {
-            target: remote.target,
-            ssh: remote_ssh,
-            remote_herdr: prepared_remote.remote_herdr,
-            sessions,
-            bridges: HashMap::new(),
-        };
-        crate::client::run_remote_session_hub(&mut hub, &session_name, keybindings)
+        let local_socket = local_forward_socket_path(&remote.target, "session-hub");
+        let program = std::env::args()
+            .next()
+            .unwrap_or_else(|| "herdr".to_string());
+        let reattach_command = reattach_command(
+            &program,
+            &remote.target,
+            &session_name,
+            remote.keybindings,
+            remote.live_handoff,
+        );
+        let remote_command =
+            remote_session_hub_bridge_command(&prepared_remote.remote_herdr, &session_name);
+        let _bridge = SshStdioBridge::start_command(
+            remote.target,
+            local_socket.clone(),
+            remote_command,
+            remote_ssh.options(),
+        )?;
+        run_client_process(&local_socket, &reattach_command, remote.keybindings)
     }
 
     #[cfg(windows)]
@@ -310,7 +310,6 @@ fn ensure_remote_named_sessions_ready(
     Ok(())
 }
 
-#[cfg(unix)]
 fn remote_session_command(remote_herdr: &RemoteHerdr, session: &str, command: &str) -> String {
     let mut full = remote_herdr.shell_path.clone();
     if session != crate::session::DEFAULT_SESSION_NAME {
@@ -320,158 +319,6 @@ fn remote_session_command(remote_herdr: &RemoteHerdr, session: &str, command: &s
     full.push(' ');
     full.push_str(command);
     full
-}
-
-#[cfg(unix)]
-struct RemoteSessionHub {
-    target: String,
-    ssh: RemoteSsh,
-    remote_herdr: RemoteHerdr,
-    sessions: Vec<crate::client::RemoteSessionDescriptor>,
-    bridges: HashMap<String, SshStdioBridge>,
-}
-
-#[cfg(unix)]
-impl RemoteSessionHub {
-    fn ensure_bridge(&mut self, session: &str) -> io::Result<PathBuf> {
-        if let Some(bridge) = self.bridges.get(session) {
-            return Ok(bridge.local_socket.clone());
-        }
-        let local_socket = local_forward_socket_path(&self.target, session);
-        let bridge = SshStdioBridge::start(
-            self.target.clone(),
-            self.remote_herdr.clone(),
-            local_socket.clone(),
-            session.to_owned(),
-            self.ssh.options(),
-        )?;
-        self.bridges.insert(session.to_owned(), bridge);
-        Ok(local_socket)
-    }
-
-    fn session_command(&self, session: &str, command: &str) -> String {
-        remote_session_command(&self.remote_herdr, session, command)
-    }
-}
-
-#[cfg(unix)]
-impl crate::client::SessionHubBackend for RemoteSessionHub {
-    fn sessions(&self) -> &[crate::client::RemoteSessionDescriptor] {
-        &self.sessions
-    }
-
-    fn connect_client(&mut self, session: &str) -> io::Result<crate::ipc::LocalStream> {
-        let socket = self.ensure_bridge(session)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match crate::ipc::connect_local_stream(&socket) {
-                Ok(stream) => return Ok(stream),
-                Err(err) if Instant::now() < deadline => {
-                    tracing::debug!(%err, %session, "waiting for session bridge");
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    fn focus_workspace(&self, session: &str, workspace_id: &str) -> io::Result<()> {
-        let command = self.session_command(
-            session,
-            &format!("workspace focus {}", shell_quote(workspace_id)),
-        );
-        let output = self.ssh.user_shell_output(&command)?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(command_failed("remote workspace focus failed", &output))
-        }
-    }
-
-    fn create_session(&mut self, session: &str) -> io::Result<()> {
-        crate::session::parse_target_name(session).map_err(io::Error::other)?;
-        if self.sessions.iter().any(|item| item.name == session) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("session {session} already exists"),
-            ));
-        }
-        self.ensure_bridge(session)?;
-        self.sessions.push(crate::client::RemoteSessionDescriptor {
-            name: session.to_owned(),
-            running: true,
-        });
-        Ok(())
-    }
-
-    fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()> {
-        crate::session::parse_target_name(session).map_err(io::Error::other)?;
-        crate::session::parse_target_name(new_name).map_err(io::Error::other)?;
-        if session == crate::session::DEFAULT_SESSION_NAME
-            || new_name == crate::session::DEFAULT_SESSION_NAME
-        {
-            return Err(io::Error::other("the default session cannot be renamed"));
-        }
-        if self.sessions.iter().any(|item| item.name == new_name) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("session {new_name} already exists"),
-            ));
-        }
-        self.bridges.remove(session);
-        let command = format!(
-            "{} session rename {} {} --json",
-            self.remote_herdr.shell_path,
-            shell_quote(session),
-            shell_quote(new_name)
-        );
-        let output = self.ssh.user_shell_output(&command)?;
-        if !output.status.success() {
-            return Err(command_failed("remote session rename failed", &output));
-        }
-        if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
-            item.name = new_name.to_owned();
-            item.running = false;
-        }
-        Ok(())
-    }
-
-    fn close_session(&mut self, session: &str) -> io::Result<()> {
-        if session == crate::session::DEFAULT_SESSION_NAME {
-            return Err(io::Error::other("the default session cannot be closed"));
-        }
-        let running = self
-            .sessions
-            .iter()
-            .find(|item| item.name == session)
-            .is_some_and(|item| item.running);
-        self.bridges.remove(session);
-        if running {
-            let stop = format!(
-                "{} session stop {} --json",
-                self.remote_herdr.shell_path,
-                shell_quote(session)
-            );
-            let output = self.ssh.user_shell_output(&stop)?;
-            if !output.status.success() {
-                return Err(command_failed("remote session stop failed", &output));
-            }
-            if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
-                item.running = false;
-            }
-        }
-        let delete = format!(
-            "{} session delete {} --json",
-            self.remote_herdr.shell_path,
-            shell_quote(session)
-        );
-        let output = self.ssh.user_shell_output(&delete)?;
-        if !output.status.success() {
-            return Err(command_failed("remote session delete failed", &output));
-        }
-        self.sessions.retain(|item| item.name != session);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1906,6 +1753,7 @@ fn confirm_remote_install(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
@@ -1916,7 +1764,15 @@ fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> Stri
     command
 }
 
-#[cfg(any(windows, test))]
+#[cfg(unix)]
+fn remote_session_hub_bridge_command(remote_herdr: &RemoteHerdr, initial_session: &str) -> String {
+    format!(
+        "exec {} session hub-bridge {}",
+        remote_herdr.shell_path,
+        shell_quote(initial_session)
+    )
+}
+
 fn reattach_command(
     program: &str,
     target: &str,
@@ -1959,11 +1815,22 @@ struct SshStdioBridge {
 }
 
 impl SshStdioBridge {
+    #[cfg(any(windows, test))]
     fn start(
         target: String,
         remote_herdr: RemoteHerdr,
         local_socket: PathBuf,
         session_name: String,
+        ssh_options: Option<&ManagedSshOptions>,
+    ) -> io::Result<Self> {
+        let remote_command = remote_bridge_command(&remote_herdr, &session_name);
+        Self::start_command(target, local_socket, remote_command, ssh_options)
+    }
+
+    fn start_command(
+        target: String,
+        local_socket: PathBuf,
+        remote_command: String,
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
@@ -2000,16 +1867,14 @@ impl SshStdioBridge {
                             }
                         };
                         let connection_target = target.clone();
-                        let connection_herdr = remote_herdr.clone();
-                        let connection_session = session_name.clone();
+                        let connection_command = remote_command.clone();
                         let connection_ssh_options = thread_ssh_options.clone();
                         let connection_stop = Arc::clone(&thread_stop);
                         thread::spawn(move || {
                             if let Err(err) = bridge_connection(
                                 stream,
                                 &connection_target,
-                                &connection_herdr,
-                                &connection_session,
+                                &connection_command,
                                 connection_ssh_options.as_ref(),
                                 &connection_stop,
                             ) {
@@ -2117,8 +1982,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
+    remote_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
     _bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -2127,7 +1991,7 @@ fn bridge_connection(
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -2172,8 +2036,7 @@ fn bridge_connection(
 fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
+    remote_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -2182,7 +2045,7 @@ fn bridge_connection(
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -2411,7 +2274,6 @@ fn copy_local_stream_to_writer<W: io::Write>(
     Ok(total)
 }
 
-#[cfg(windows)]
 fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
@@ -2424,7 +2286,7 @@ fn run_client_process(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
             local_socket,
         )
-        .env("HERDR_RENDER_ENCODING", "terminal-ansi")
+        .env("HERDR_RENDER_ENCODING", "semantic-frame")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
@@ -3061,6 +2923,20 @@ mod tests {
         assert_eq!(
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_session_hub_bridge_runs_on_remote_host() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+
+        assert_eq!(
+            remote_session_hub_bridge_command(&remote_herdr, "client work"),
+            "exec \"$HOME/.local/bin/herdr\" session hub-bridge 'client work'"
         );
     }
 

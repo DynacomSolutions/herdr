@@ -406,6 +406,18 @@ fn run_session_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => session_list(&args[1..]),
         "attach" => session_attach_help(&args[1..]),
+        #[cfg(unix)]
+        "hub-bridge" => {
+            if args.len() > 2 {
+                return Ok(2);
+            }
+            let initial_session = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(crate::session::DEFAULT_SESSION_NAME);
+            crate::client::run_local_session_hub_bridge(initial_session)?;
+            Ok(0)
+        }
         "stop" => session_stop(&args[1..]),
         "delete" => session_delete(&args[1..]),
         "rename" => session_rename(&args[1..]),

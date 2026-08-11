@@ -1061,7 +1061,11 @@ impl AppState {
                         .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
                     self.context_menu = Some(ContextMenuState {
                         kind,
-                        x: mouse.column,
+                        x: self
+                            .view
+                            .sidebar_rect
+                            .x
+                            .saturating_add(self.view.sidebar_rect.width),
                         y: mouse.row,
                         list: MenuListState::new(0),
                     });
@@ -2131,6 +2135,38 @@ mod tests {
             app.state.context_menu.as_ref().map(|menu| &menu.kind),
             Some(ContextMenuKind::Pane { pane_id, .. }) if *pane_id == default_pane
         ));
+    }
+
+    #[test]
+    fn workspace_context_menu_opens_beside_sidebar() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let card = app.state.view.workspace_card_areas[0].rect;
+        let sidebar_right = app
+            .state
+            .view
+            .sidebar_rect
+            .x
+            .saturating_add(app.state.view.sidebar_rect.width);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            card.x + 1,
+            card.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("workspace menu");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::Workspace { ws_idx: 0 }
+                | ContextMenuKind::GitWorkspace { ws_idx: 0, .. }
+        ));
+        assert_eq!(menu.x, sidebar_right);
+        assert_eq!(app.state.context_menu_rect().unwrap().x, sidebar_right);
     }
 
     #[tokio::test]
