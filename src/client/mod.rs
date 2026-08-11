@@ -45,7 +45,7 @@ use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
     ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    MAX_GRAPHICS_FRAME_SIZE, MAX_RENDER_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
 
@@ -1347,6 +1347,15 @@ fn run_client_with_mode(
     Ok(())
 }
 
+fn decompress_server_message(msg: ServerMessage) -> Result<ServerMessage, ClientError> {
+    let ServerMessage::CompressedFrame(frame) = msg else {
+        return Ok(msg);
+    };
+    frame.decode().map(ServerMessage::Frame).map_err(|err| {
+        ClientError::ConnectionLost(io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+    })
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -1467,7 +1476,7 @@ async fn run_client_loop(
         let max_frame_size = if kitty_graphics_enabled {
             MAX_GRAPHICS_FRAME_SIZE
         } else {
-            MAX_FRAME_SIZE
+            MAX_RENDER_FRAME_SIZE
         };
         server_reader_thread(
             read_stream,
@@ -1649,7 +1658,7 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
+            ClientLoopEvent::ServerMessage(msg) => match decompress_server_message(msg)? {
                 ServerMessage::Frame(frame_data) => {
                     let frame_data = if state.draw_host_cursor {
                         render_ansi::frame_with_drawn_cursor(frame_data)
@@ -1860,6 +1869,7 @@ async fn run_client_loop(
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
                 }
+                ServerMessage::CompressedFrame(_) => unreachable!("compressed frame normalized"),
             },
             ClientLoopEvent::ServerDisconnected => {
                 return Err(ClientError::ConnectionLost(io::Error::new(

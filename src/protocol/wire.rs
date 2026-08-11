@@ -6,6 +6,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +21,16 @@ pub const PROTOCOL_VERSION: u32 = 20;
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
+
+/// Maximum server-to-client text render payload after optional compression.
+/// Control and client-to-server traffic remain capped by `MAX_FRAME_SIZE`.
+pub const MAX_RENDER_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+/// Maximum semantic frame size accepted after decompression.
+pub const MAX_DECOMPRESSED_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
+/// Large semantic grids are compressed before outer protocol framing.
+pub const SEMANTIC_FRAME_COMPRESSION_CELL_THRESHOLD: usize = 32 * 1024;
 
 /// Maximum allowed server-to-client frame payload when Kitty graphics are enabled.
 /// Normal traffic keeps `MAX_FRAME_SIZE`; this larger cap is only for explicit
@@ -539,6 +552,79 @@ pub struct FrameData {
     pub graphics: Vec<u8>,
 }
 
+/// A zlib-compressed bincode `FrameData` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressedFrame {
+    /// Exact decoded byte length, used to bound allocation and detect truncation.
+    pub uncompressed_len: u32,
+    /// Zlib-compressed bincode payload.
+    pub payload: Vec<u8>,
+}
+
+impl CompressedFrame {
+    pub fn encode(frame: &FrameData) -> Result<Self, FramingError> {
+        let uncompressed = bincode::serde::encode_to_vec(frame, bincode::config::standard())
+            .map_err(|err| FramingError::Bincode(err.to_string()))?;
+        if uncompressed.len() > MAX_DECOMPRESSED_FRAME_SIZE {
+            return Err(FramingError::Oversized {
+                claimed: uncompressed.len(),
+                max: MAX_DECOMPRESSED_FRAME_SIZE,
+            });
+        }
+        let uncompressed_len = u32::try_from(uncompressed.len()).map_err(|_| {
+            FramingError::Bincode("semantic frame length exceeds u32::MAX".to_owned())
+        })?;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&uncompressed)?;
+        let payload = encoder.finish()?;
+        Ok(Self {
+            uncompressed_len,
+            payload,
+        })
+    }
+
+    pub fn decode(self) -> Result<FrameData, FramingError> {
+        let uncompressed_len = self.uncompressed_len as usize;
+        if uncompressed_len > MAX_DECOMPRESSED_FRAME_SIZE {
+            return Err(FramingError::Oversized {
+                claimed: uncompressed_len,
+                max: MAX_DECOMPRESSED_FRAME_SIZE,
+            });
+        }
+
+        let limit = u64::from(self.uncompressed_len).saturating_add(1);
+        let mut uncompressed = Vec::with_capacity(uncompressed_len);
+        ZlibDecoder::new(self.payload.as_slice())
+            .take(limit)
+            .read_to_end(&mut uncompressed)?;
+        if uncompressed.len() != uncompressed_len {
+            return Err(FramingError::Compression(format!(
+                "semantic frame decoded {} bytes; expected {uncompressed_len}",
+                uncompressed.len()
+            )));
+        }
+
+        let (frame, consumed): (FrameData, usize) =
+            bincode::serde::decode_from_slice(&uncompressed, bincode::config::standard())
+                .map_err(|err| FramingError::Bincode(err.to_string()))?;
+        if consumed != uncompressed_len {
+            return Err(FramingError::Bincode(format!(
+                "decoded {consumed} bytes but semantic frame length was {uncompressed_len}"
+            )));
+        }
+        let expected_cells = usize::from(frame.width) * usize::from(frame.height);
+        if frame.cells.len() != expected_cells {
+            return Err(FramingError::Compression(format!(
+                "semantic frame has {} cells; expected {expected_cells} for {}x{}",
+                frame.cells.len(),
+                frame.width,
+                frame.height
+            )));
+        }
+        Ok(frame)
+    }
+}
+
 impl FrameData {
     /// Creates a `FrameData` from a ratatui `Buffer` and optional cursor.
     ///
@@ -753,6 +839,9 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// A compressed semantic frame for large terminal grids.
+    CompressedFrame(CompressedFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +954,8 @@ pub enum FramingError {
     Io(io::Error),
     /// Bincode serialization or deserialization failed.
     Bincode(String),
+    /// Semantic frame compression or decompression failed.
+    Compression(String),
     /// The connection was closed before a complete frame could be read.
     UnexpectedEof,
 }
@@ -877,6 +968,7 @@ impl std::fmt::Display for FramingError {
             }
             FramingError::Io(e) => write!(f, "I/O error: {e}"),
             FramingError::Bincode(e) => write!(f, "bincode error: {e}"),
+            FramingError::Compression(e) => write!(f, "frame compression error: {e}"),
             FramingError::UnexpectedEof => write!(f, "unexpected end of stream"),
         }
     }
@@ -1479,6 +1571,88 @@ mod tests {
             }
             other => panic!("expected frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compressed_frame_roundtrips_exactly() {
+        let frame = FrameData {
+            cells: vec![
+                CellData {
+                    symbol: "H".into(),
+                    fg: 0x00ff_0000,
+                    bg: 0,
+                    modifier: Modifier::BOLD.bits(),
+                    skip: false,
+                    hyperlink: Some(0),
+                },
+                CellData {
+                    symbol: "\u{1f980}".into(),
+                    fg: 0x0000_ffff,
+                    bg: 0x0000_00ff,
+                    modifier: Modifier::ITALIC.bits(),
+                    skip: false,
+                    hyperlink: None,
+                },
+            ],
+            width: 2,
+            height: 1,
+            cursor: Some(CursorState {
+                x: 1,
+                y: 0,
+                visible: true,
+                shape: 6,
+            }),
+            hyperlinks: vec!["https://example.com".to_owned()],
+            graphics: Vec::new(),
+        };
+
+        let compressed = CompressedFrame::encode(&frame).expect("compress semantic frame");
+        assert_eq!(
+            compressed.decode().expect("decompress semantic frame"),
+            frame
+        );
+    }
+
+    #[test]
+    fn compressed_frame_rejects_oversized_declared_length() {
+        let compressed = CompressedFrame {
+            uncompressed_len: (MAX_DECOMPRESSED_FRAME_SIZE + 1) as u32,
+            payload: Vec::new(),
+        };
+
+        assert!(matches!(
+            compressed.decode(),
+            Err(FramingError::Oversized {
+                claimed,
+                max: MAX_DECOMPRESSED_FRAME_SIZE,
+            }) if claimed == MAX_DECOMPRESSED_FRAME_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn compressed_frame_rejects_decoded_length_mismatch() {
+        let frame = FrameData {
+            cells: vec![CellData {
+                symbol: "x".into(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            }],
+            width: 1,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let mut compressed = CompressedFrame::encode(&frame).expect("compress semantic frame");
+        compressed.uncompressed_len += 1;
+
+        assert!(matches!(
+            compressed.decode(),
+            Err(FramingError::Compression(_))
+        ));
     }
 
     #[test]

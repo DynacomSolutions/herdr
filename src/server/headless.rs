@@ -43,7 +43,8 @@ use crate::ipc::{
     SocketFileIdentity,
 };
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, CompressedFrame, FrameData, ServerMessage,
+    MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE, SEMANTIC_FRAME_COMPRESSION_CELL_THRESHOLD,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -2632,7 +2633,13 @@ impl HeadlessServer {
 
     /// Encodes a server message into a length-prefixed frame.
     fn frame_server_message(msg: &ServerMessage) -> Result<Vec<u8>, protocol::FramingError> {
-        Self::frame_server_message_with_max(msg, MAX_FRAME_SIZE)
+        let max = match msg {
+            ServerMessage::Frame(_)
+            | ServerMessage::CompressedFrame(_)
+            | ServerMessage::Terminal(_) => MAX_RENDER_FRAME_SIZE,
+            _ => MAX_FRAME_SIZE,
+        };
+        Self::frame_server_message_with_max(msg, max)
     }
 
     /// Encodes a server message using an explicit payload cap.
@@ -2640,8 +2647,49 @@ impl HeadlessServer {
         msg: &ServerMessage,
         max_frame_size: usize,
     ) -> Result<Vec<u8>, protocol::FramingError> {
+        if let ServerMessage::Frame(frame) = msg {
+            if frame.cells.len() >= SEMANTIC_FRAME_COMPRESSION_CELL_THRESHOLD {
+                return Self::frame_compressed_semantic_frame(frame, max_frame_size);
+            }
+
+            let framed = Self::serialize_server_message(msg)?;
+            if framed.len().saturating_sub(4) <= max_frame_size {
+                return Ok(framed);
+            }
+            return Self::frame_compressed_semantic_frame(frame, max_frame_size);
+        }
+
+        let framed = Self::serialize_server_message(msg)?;
+        Self::enforce_server_frame_limit(framed, max_frame_size)
+    }
+
+    fn frame_compressed_semantic_frame(
+        frame: &FrameData,
+        max_frame_size: usize,
+    ) -> Result<Vec<u8>, protocol::FramingError> {
+        let compressed = CompressedFrame::encode(frame)?;
+        crate::render_prof::counter(
+            "semantic_frame.compressed_bytes",
+            compressed.payload.len() as u64,
+        );
+        crate::render_prof::counter(
+            "semantic_frame.uncompressed_bytes",
+            u64::from(compressed.uncompressed_len),
+        );
+        let framed = Self::serialize_server_message(&ServerMessage::CompressedFrame(compressed))?;
+        Self::enforce_server_frame_limit(framed, max_frame_size)
+    }
+
+    fn serialize_server_message(msg: &ServerMessage) -> Result<Vec<u8>, protocol::FramingError> {
         let mut framed = Vec::new();
         protocol::write_message(&mut framed, msg)?;
+        Ok(framed)
+    }
+
+    fn enforce_server_frame_limit(
+        framed: Vec<u8>,
+        max_frame_size: usize,
+    ) -> Result<Vec<u8>, protocol::FramingError> {
         let payload_len = framed.len().saturating_sub(4);
         if payload_len > max_frame_size {
             return Err(protocol::FramingError::Oversized {
@@ -4544,7 +4592,7 @@ impl HeadlessServer {
             let max = if has_graphics {
                 MAX_GRAPHICS_FRAME_SIZE
             } else {
-                crate::protocol::MAX_FRAME_SIZE
+                MAX_RENDER_FRAME_SIZE
             };
             let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
                 Ok(frame) => frame,
@@ -5353,8 +5401,75 @@ mod tests {
             .expect("decode server frame")
         {
             ServerMessage::Frame(frame) => frame,
+            ServerMessage::CompressedFrame(frame) => {
+                frame.decode().expect("decompress semantic frame")
+            }
             other => panic!("expected frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn large_semantic_frame_is_compressed_below_legacy_limit() {
+        const WIDTH: u16 = 710;
+        const HEIGHT: u16 = 96;
+        let cells = (0..usize::from(WIDTH) * usize::from(HEIGHT))
+            .map(|index| CellData {
+                symbol: format!("{index:024x}"),
+                fg: index as u32,
+                bg: !(index as u32),
+                modifier: (index % 16) as u16,
+                skip: false,
+                hyperlink: None,
+            })
+            .collect();
+        let frame = FrameData {
+            cells,
+            width: WIDTH,
+            height: HEIGHT,
+            cursor: Some(CursorState {
+                x: WIDTH - 1,
+                y: HEIGHT - 1,
+                visible: true,
+                shape: 2,
+            }),
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+
+        let raw = HeadlessServer::serialize_server_message(&ServerMessage::Frame(frame.clone()))
+            .expect("serialize raw semantic frame");
+        assert!(raw.len() - 4 > MAX_FRAME_SIZE);
+
+        let framed = HeadlessServer::frame_server_message(&ServerMessage::Frame(frame.clone()))
+            .expect("frame compressed semantic frame");
+        assert!(framed.len() - 4 <= MAX_FRAME_SIZE);
+        let decoded = protocol::read_message::<_, ServerMessage>(
+            &mut std::io::Cursor::new(framed),
+            MAX_RENDER_FRAME_SIZE,
+        )
+        .expect("decode server message");
+        let ServerMessage::CompressedFrame(compressed) = decoded else {
+            panic!("expected compressed semantic frame");
+        };
+        assert_eq!(
+            compressed.decode().expect("decompress semantic frame"),
+            frame
+        );
+    }
+
+    #[test]
+    fn large_terminal_redraw_uses_render_frame_limit() {
+        let msg = ServerMessage::Terminal(crate::protocol::TerminalFrame {
+            seq: 1,
+            width: 710,
+            height: 96,
+            full: true,
+            bytes: vec![b'x'; MAX_FRAME_SIZE + 1],
+        });
+
+        let framed = HeadlessServer::frame_server_message(&msg).expect("frame terminal redraw");
+        assert!(framed.len() - 4 > MAX_FRAME_SIZE);
+        assert!(framed.len() - 4 <= MAX_RENDER_FRAME_SIZE);
     }
 
     fn frame_text(frame: &FrameData) -> String {
