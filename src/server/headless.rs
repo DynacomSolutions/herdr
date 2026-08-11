@@ -53,7 +53,7 @@ use crate::server::client_accept::{
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
-    ClientConnection, ClientConnectionMode, DeferredRender,
+    ClientConnection, ClientConnectionMode, DeferredRender, RenderTarget,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -760,7 +760,10 @@ impl HeadlessServer {
                             RetainedGraphicsOutcome::Fallback => false,
                         }
                     }
-                    RetainedRenderPlan::Pty => self.render_retained_pty_update_and_stream(),
+                    RetainedRenderPlan::Pty => self
+                        .render_retained_pty_update_and_stream_for_sources(Some(
+                            &render_request.pty_sources,
+                        )),
                     RetainedRenderPlan::HiddenPty => {
                         crate::render_prof::event("render.skipped.hidden_sources");
                         true
@@ -4182,7 +4185,19 @@ impl HeadlessServer {
         !tab.zoomed || tab.layout.focused() == pane_id
     }
 
+    #[cfg(test)]
     fn render_retained_pty_update_and_stream(&mut self) -> bool {
+        self.render_retained_pty_update_and_stream_for_sources(None)
+    }
+
+    /// Stream an update that only changes terminal output without redrawing
+    /// unrelated direct terminal observers. A direct observer has no shared
+    /// app surface to repaint, so rendering every other observed terminal for
+    /// each pane's output multiplies CPU work by the observer count.
+    fn render_retained_pty_update_and_stream_for_sources(
+        &mut self,
+        dirty_sources: Option<&HashSet<crate::layout::PaneId>>,
+    ) -> bool {
         crate::render_prof::event("retained.attempt");
         let retained_started = crate::render_prof::timer();
         macro_rules! retained_fallback {
@@ -4206,6 +4221,42 @@ impl HeadlessServer {
         }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
+        if let Some(dirty_sources) = dirty_sources {
+            if render_targets.iter().any(|(_, _, _, _, mode)| {
+                matches!(
+                    mode,
+                    ClientConnectionMode::TerminalAttach { .. }
+                        | ClientConnectionMode::TerminalObserve { .. }
+                )
+            }) {
+                let dirty_terminal_ids = dirty_sources
+                    .iter()
+                    .filter_map(|&pane_id| self.terminal_id_for_pane(pane_id))
+                    .map(|terminal_id| terminal_id.as_str())
+                    .collect::<HashSet<_>>();
+                // Keep the app surface live, but only redraw direct terminal
+                // streams whose own terminal changed. This prevents N direct
+                // observers from producing N full terminal frames for every
+                // pane update while preserving the dashboard's full view.
+                let dirty_targets: Vec<RenderTarget> = render_targets
+                    .into_iter()
+                    .filter(|(_, _, _, _, mode)| match mode {
+                        ClientConnectionMode::TerminalAttach { terminal_id }
+                        | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                            dirty_terminal_ids.contains(terminal_id.as_str())
+                        }
+                        ClientConnectionMode::App => true,
+                    })
+                    .collect();
+
+                if dirty_targets.is_empty() {
+                    retained_success!("terminal_targets_hidden");
+                }
+
+                self.render_and_stream_targets(dirty_targets);
+                retained_success!("terminal_targets");
+            }
+        }
         let [(client_id, (cols, rows), cell_size, _is_foreground, mode)] =
             render_targets.as_slice()
         else {
@@ -4397,8 +4448,12 @@ impl HeadlessServer {
     }
 
     fn render_and_stream(&mut self) {
-        let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
+        self.render_and_stream_targets(render_targets);
+    }
+
+    fn render_and_stream_targets(&mut self, render_targets: Vec<RenderTarget>) {
+        let full_started = crate::render_prof::timer();
 
         if render_targets.is_empty() {
             let (cols, rows) = self.effective_size;
@@ -9745,6 +9800,61 @@ next_tab = ""
         );
 
         assert!(server.pty_sources_visible_to_any_render_target(&HashSet::from([background_pane])));
+    }
+
+    #[test]
+    fn direct_terminal_observer_renders_only_the_dirty_terminal_target() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+            server.app.state.active = Some(0);
+            server.app.state.selected = 0;
+            server.app.state.mode = crate::app::Mode::Terminal;
+            let (writer, _control_rx, render_rx) = test_client_writer();
+            server.clients.insert(
+                7,
+                ClientConnection::new_with_mode(
+                    ClientConnectionMode::TerminalObserve {
+                        terminal_id: terminal_id_string,
+                    },
+                    None,
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    7,
+                    RenderEncoding::TerminalAnsi,
+                    false,
+                    Some(writer),
+                ),
+            );
+
+            server.render_and_stream();
+            let _initial = render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial observer frame");
+
+            let runtime = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("terminal runtime");
+            runtime.test_process_pty_bytes(b"\rupdated");
+
+            assert!(
+                server.render_retained_pty_update_and_stream_for_sources(Some(&HashSet::from([
+                    pane_id
+                ]),))
+            );
+            let message = read_server_message(
+                render_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("updated observer frame"),
+            );
+            let ServerMessage::Terminal(updated) = message else {
+                panic!("expected terminal observer frame, got {message:?}");
+            };
+            assert!(String::from_utf8_lossy(&updated.bytes).contains("updated"));
+        });
     }
 
     #[tokio::test]
