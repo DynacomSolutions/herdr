@@ -2519,17 +2519,20 @@ mod tests {
     }
 
     #[test]
-    fn moving_sidebar_rows_preserves_standard_content_columns() {
+    fn moving_sidebar_rows_preserves_standard_branch_status_line() {
         let source = labelled_frame(8, 6);
         let mut composed = source.clone();
         let blank = source.cells[0].clone();
 
         fill_frame_row(&mut composed, 2, 3, &blank);
+        fill_frame_row(&mut composed, 3, 3, &blank);
         copy_frame_row(&source, &mut composed, 1, 2, 3);
+        copy_frame_row(&source, &mut composed, 2, 3, 3);
 
         for x in 0..3 {
             let x = x as usize;
             assert_eq!(composed.cells[2 * 8 + x], source.cells[8 + x]);
+            assert_eq!(composed.cells[3 * 8 + x], source.cells[2 * 8 + x]);
         }
         for y in 0..6 {
             for x in 3..8 {

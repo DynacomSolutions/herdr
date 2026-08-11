@@ -525,23 +525,23 @@ impl App {
                     self.state.view.sidebar_rect,
                     self.state.sidebar_section_split,
                 );
-                let workspace_cards = self
-                    .state
-                    .view
-                    .workspace_card_areas
-                    .iter()
-                    .filter_map(|card| {
-                        self.state.workspaces.get(card.ws_idx).map(|workspace| {
-                            crate::protocol::SessionWorkspaceCardSummary {
-                                workspace_id: workspace.id.clone(),
-                                x: card.rect.x,
-                                y: card.rect.y,
-                                width: card.rect.width,
-                                height: card.rect.height,
-                            }
-                        })
+                let workspace_cards = crate::ui::compute_workspace_card_areas(
+                    &self.state,
+                    self.state.view.sidebar_rect,
+                )
+                .iter()
+                .filter_map(|card| {
+                    self.state.workspaces.get(card.ws_idx).map(|workspace| {
+                        crate::protocol::SessionWorkspaceCardSummary {
+                            workspace_id: workspace.id.clone(),
+                            x: card.rect.x,
+                            y: card.rect.y,
+                            width: card.rect.width,
+                            height: card.rect.height,
+                        }
                     })
-                    .collect();
+                })
+                .collect();
                 crate::protocol::SessionSidebarSummary {
                     width: self.state.view.sidebar_rect.width,
                     spaces_y: spaces.y,

@@ -2166,6 +2166,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_summary_recomputes_workspace_card_height_after_git_refresh() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("repo");
+        workspace.cached_git_branch = None;
+        workspace.cached_git_ahead_behind = None;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        assert_eq!(app.state.view.workspace_card_areas[0].rect.height, 1);
+
+        app.state.workspaces[0].cached_git_branch = Some("feature/session-details".into());
+
+        let sidebar = app.session_summary().sidebar.expect("desktop sidebar");
+        assert_eq!(sidebar.workspace_cards[0].height, 2);
+    }
+
     #[tokio::test]
     async fn pane_right_click_passthrough_falls_back_when_mouse_reporting_is_off() {
         let mut app = app_for_mouse_test();
