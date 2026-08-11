@@ -567,6 +567,7 @@ impl App {
                 })
                 .collect(),
             sidebar,
+            overlay_active: self.state.mode != crate::app::Mode::Terminal,
         }
     }
 }

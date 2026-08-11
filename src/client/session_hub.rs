@@ -12,7 +12,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
-use crate::api::schema::AgentStatus;
 use crate::ipc::LocalStream;
 use crate::protocol::{
     ClientInputEvent, ClientKeybindings, ClientLaunchMode, ClientMessage, ClientMouseKind,
@@ -33,11 +32,14 @@ pub(crate) trait SessionHubBackend {
     fn connect_client(&mut self, session: &str) -> io::Result<LocalStream>;
     fn focus_workspace(&self, session: &str, workspace_id: &str) -> io::Result<()>;
     fn create_session(&mut self, session: &str) -> io::Result<()>;
+    fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()>;
+    fn close_session(&mut self, session: &str) -> io::Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HubStreamKind {
     App,
+    Sidebar,
     Summary,
 }
 
@@ -47,6 +49,9 @@ struct HubSession {
     summary: Option<SessionSummary>,
     summary_generation: u64,
     summary_stream: Option<LocalStream>,
+    sidebar_generation: u64,
+    sidebar_stream: Option<LocalStream>,
+    sidebar_frame: Option<FrameData>,
 }
 
 struct ActiveSession {
@@ -59,11 +64,13 @@ struct ActiveSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HubRowTarget {
     Session(String),
-    Workspace {
+    SpaceRow {
         session: String,
         workspace_id: String,
+        original_y: u16,
     },
-    ActiveSidebarRow {
+    SpaceGapRow {
+        session: String,
         original_y: u16,
     },
     NewSession,
@@ -75,10 +82,29 @@ struct HubRow {
     target: HubRowTarget,
 }
 
-#[derive(Default)]
 struct NewSessionModal {
     name: String,
     error: Option<String>,
+}
+
+enum SessionModal {
+    Create(NewSessionModal),
+    Rename {
+        session: String,
+        name: String,
+        error: Option<String>,
+    },
+    ConfirmClose {
+        session: String,
+        error: Option<String>,
+    },
+}
+
+struct SessionContextMenu {
+    session: String,
+    x: u16,
+    y: u16,
+    highlighted: usize,
 }
 
 struct HubState {
@@ -86,7 +112,8 @@ struct HubState {
     collapsed: HashSet<String>,
     active: ActiveSession,
     next_generation: u64,
-    modal: Option<NewSessionModal>,
+    modal: Option<SessionModal>,
+    session_menu: Option<SessionContextMenu>,
     status: Option<String>,
     cols: u16,
     rows: u16,
@@ -94,6 +121,8 @@ struct HubState {
     full_repaint: bool,
     keybindings: ClientKeybindings,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, KeyModifiers)>,
+    server_overlay_session: Option<String>,
+    server_overlay_seen: bool,
 }
 
 impl HubState {
@@ -135,35 +164,77 @@ impl HubState {
                 continue;
             }
             if session.name == self.active.name {
-                for card in &layout.workspace_cards {
+                for (index, card) in layout.workspace_cards.iter().enumerate() {
                     for offset in 0..card.height {
                         if y >= new_session_y {
                             break;
                         }
                         rows.push(HubRow {
                             y,
-                            target: HubRowTarget::ActiveSidebarRow {
+                            target: HubRowTarget::SpaceRow {
+                                session: session.name.clone(),
+                                workspace_id: card.workspace_id.clone(),
                                 original_y: card.y.saturating_add(offset),
                             },
                         });
                         y = y.saturating_add(1);
                     }
+                    if let Some(next) = layout.workspace_cards.get(index + 1) {
+                        for original_y in card.y.saturating_add(card.height)..next.y {
+                            if y >= new_session_y {
+                                break;
+                            }
+                            rows.push(HubRow {
+                                y,
+                                target: HubRowTarget::SpaceGapRow {
+                                    session: session.name.clone(),
+                                    original_y,
+                                },
+                            });
+                            y = y.saturating_add(1);
+                        }
+                    }
                 }
                 continue;
             }
-            if let Some(summary) = &session.summary {
-                for workspace in &summary.workspaces {
+            if let Some(layout) = session
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.sidebar.as_ref())
+            {
+                for (index, card) in layout.workspace_cards.iter().enumerate() {
                     if y >= new_session_y {
                         break;
                     }
-                    rows.push(HubRow {
-                        y,
-                        target: HubRowTarget::Workspace {
-                            session: session.name.clone(),
-                            workspace_id: workspace.workspace_id.clone(),
-                        },
-                    });
-                    y = y.saturating_add(1);
+                    for offset in 0..card.height {
+                        if y >= new_session_y {
+                            break;
+                        }
+                        rows.push(HubRow {
+                            y,
+                            target: HubRowTarget::SpaceRow {
+                                session: session.name.clone(),
+                                workspace_id: card.workspace_id.clone(),
+                                original_y: card.y.saturating_add(offset),
+                            },
+                        });
+                        y = y.saturating_add(1);
+                    }
+                    if let Some(next) = layout.workspace_cards.get(index + 1) {
+                        for original_y in card.y.saturating_add(card.height)..next.y {
+                            if y >= new_session_y {
+                                break;
+                            }
+                            rows.push(HubRow {
+                                y,
+                                target: HubRowTarget::SpaceGapRow {
+                                    session: session.name.clone(),
+                                    original_y,
+                                },
+                            });
+                            y = y.saturating_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -180,6 +251,16 @@ impl HubState {
         self.sessions
             .iter_mut()
             .find(|session| session.name == name)
+    }
+
+    fn session_frame(&self, name: &str) -> Option<&FrameData> {
+        if name == self.active.name {
+            return self.active.frame.as_ref();
+        }
+        self.sessions
+            .iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.sidebar_frame.as_ref())
     }
 }
 
@@ -269,6 +350,9 @@ pub(crate) fn run_remote_session_hub(
             summary: None,
             summary_generation: 0,
             summary_stream: None,
+            sidebar_generation: 0,
+            sidebar_stream: None,
+            sidebar_frame: None,
         })
         .collect::<Vec<_>>();
     let collapsed = sessions
@@ -282,6 +366,7 @@ pub(crate) fn run_remote_session_hub(
         active,
         next_generation,
         modal: None,
+        session_menu: None,
         status: None,
         cols,
         rows,
@@ -289,6 +374,8 @@ pub(crate) fn run_remote_session_hub(
         full_repaint: true,
         keybindings,
         remote_image_paste_key,
+        server_overlay_session: None,
+        server_overlay_seen: false,
     };
     if let Some(session) = state.session_mut(initial_session) {
         session.running = true;
@@ -416,6 +503,12 @@ async fn run_hub_loop(
                 };
                 super::write_to_server(&mut state.active.stream, &message)
                     .map_err(ClientError::ConnectionLost)?;
+                for session in &mut state.sessions {
+                    if let Some(stream) = session.sidebar_stream.as_mut() {
+                        super::write_to_server(stream, &message)
+                            .map_err(ClientError::ConnectionLost)?;
+                    }
+                }
             }
             ClientLoopEvent::HubServerMessage {
                 session,
@@ -435,12 +528,50 @@ async fn run_hub_loop(
                     )?;
                 }
                 HubStreamKind::Summary => {
+                    let overlay_is_owned =
+                        state.server_overlay_session.as_deref() == Some(session.as_str());
+                    let overlay_was_seen = state.server_overlay_seen;
+                    let mut received_overlay_active = None;
                     if let Some(hub_session) = state.session_mut(&session) {
                         if generation == hub_session.summary_generation {
                             if let ServerMessage::SessionSummary(summary) = message {
+                                received_overlay_active = Some(summary.overlay_active);
                                 hub_session.summary = Some(summary);
                                 hub_session.running = true;
                                 state.repaint = true;
+                            }
+                        }
+                    }
+                    if let Some(overlay_active) = received_overlay_active {
+                        if overlay_is_owned && overlay_active {
+                            state.server_overlay_seen = true;
+                        } else if overlay_is_owned && overlay_was_seen && !overlay_active {
+                            state.server_overlay_session = None;
+                            state.server_overlay_seen = false;
+                        } else if state.server_overlay_session.is_none()
+                            && session == state.active.name
+                            && overlay_active
+                        {
+                            state.server_overlay_session = Some(session);
+                            state.server_overlay_seen = true;
+                        }
+                    }
+                }
+                HubStreamKind::Sidebar => {
+                    if let Some(hub_session) = state.session_mut(&session) {
+                        if generation == hub_session.sidebar_generation {
+                            match super::decompress_server_message(message)? {
+                                ServerMessage::Frame(frame) => {
+                                    hub_session.sidebar_frame = Some(frame);
+                                    state.repaint = true;
+                                }
+                                ServerMessage::ServerShutdown { .. } => {
+                                    hub_session.sidebar_frame = None;
+                                    hub_session.sidebar_stream = None;
+                                    hub_session.running = false;
+                                    state.repaint = true;
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -464,6 +595,15 @@ async fn run_hub_loop(
                         if generation == hub_session.summary_generation {
                             hub_session.summary_stream = None;
                             hub_session.running = false;
+                            state.repaint = true;
+                        }
+                    }
+                }
+                HubStreamKind::Sidebar => {
+                    if let Some(hub_session) = state.session_mut(&session) {
+                        if generation == hub_session.sidebar_generation {
+                            hub_session.sidebar_stream = None;
+                            hub_session.sidebar_frame = None;
                             state.repaint = true;
                         }
                     }
@@ -551,6 +691,14 @@ fn handle_local_input(
     if state.modal.is_some() {
         return handle_modal_input(backend, state, event_tx, should_quit, events);
     }
+    if state.session_menu.is_some() {
+        return Ok(handle_session_menu_input(state, &events));
+    }
+
+    if let Some(session) = state.server_overlay_session.clone() {
+        forward_input_to_session(state, &session, &data, &events)?;
+        return Ok(false);
+    }
 
     if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
         if mouse.column < state.sidebar_width() {
@@ -560,7 +708,25 @@ fn handle_local_input(
                 .find(|row| row.y == mouse.row)
                 .map(|row| row.target);
             match target {
-                Some(HubRowTarget::ActiveSidebarRow { original_y }) => {
+                Some(HubRowTarget::SpaceRow {
+                    session,
+                    workspace_id,
+                    original_y,
+                }) => {
+                    if session != state.active.name
+                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    {
+                        switch_active(
+                            backend,
+                            state,
+                            &session,
+                            event_tx,
+                            should_quit,
+                            Some(&workspace_id),
+                        )
+                        .map_err(ClientError::ConnectionFailed)?;
+                        return Ok(true);
+                    }
                     let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
                         return Ok(false);
                     };
@@ -572,9 +738,45 @@ fn handle_local_input(
                             modifiers: mouse.modifiers.bits(),
                         }],
                     };
-                    super::write_to_server(&mut state.active.stream, &message)
-                        .map_err(ClientError::ConnectionLost)?;
+                    write_to_session(state, &session, &message)?;
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                        state.server_overlay_session = Some(session);
+                        state.server_overlay_seen = false;
+                    }
                     return Ok(false);
+                }
+                Some(HubRowTarget::SpaceGapRow {
+                    session,
+                    original_y,
+                }) => {
+                    let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
+                        return Ok(false);
+                    };
+                    write_to_session(
+                        state,
+                        &session,
+                        &ClientMessage::InputEvents {
+                            events: vec![ClientInputEvent::Mouse {
+                                kind,
+                                column: mouse.column,
+                                row: original_y,
+                                modifiers: mouse.modifiers.bits(),
+                            }],
+                        },
+                    )?;
+                    return Ok(false);
+                }
+                Some(HubRowTarget::Session(session))
+                    if session != crate::session::DEFAULT_SESSION_NAME
+                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) =>
+                {
+                    state.session_menu = Some(SessionContextMenu {
+                        session,
+                        x: mouse.column,
+                        y: mouse.row,
+                        highlighted: 0,
+                    });
+                    return Ok(true);
                 }
                 Some(target) => {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -637,6 +839,136 @@ fn handle_local_input(
     Ok(false)
 }
 
+fn session_menu_rect(state: &HubState) -> Option<Rect> {
+    let menu = state.session_menu.as_ref()?;
+    let width = 16.min(state.cols.max(1));
+    let height = 4.min(state.rows.max(1));
+    Some(Rect::new(
+        menu.x.min(state.cols.saturating_sub(width)),
+        menu.y.min(state.rows.saturating_sub(height)),
+        width,
+        height,
+    ))
+}
+
+fn handle_session_menu_input(
+    state: &mut HubState,
+    events: &[crate::raw_input::RawInputEvent],
+) -> bool {
+    let Some(event) = events.first() else {
+        return false;
+    };
+    match event {
+        crate::raw_input::RawInputEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            match key.code {
+                KeyCode::Esc => state.session_menu = None,
+                KeyCode::Up | KeyCode::Down => {
+                    if let Some(menu) = state.session_menu.as_mut() {
+                        menu.highlighted = usize::from(menu.highlighted == 0);
+                    }
+                }
+                KeyCode::Enter => open_session_menu_action(state),
+                _ => {}
+            }
+            true
+        }
+        crate::raw_input::RawInputEvent::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+        {
+            let selected = session_menu_rect(state).and_then(|rect| {
+                let inner_y = rect.y.saturating_add(1);
+                (mouse.column > rect.x
+                    && mouse.column < rect.x.saturating_add(rect.width).saturating_sub(1)
+                    && mouse.row >= inner_y
+                    && mouse.row < inner_y.saturating_add(2))
+                .then_some((mouse.row - inner_y) as usize)
+            });
+            if let Some(selected) = selected {
+                if let Some(menu) = state.session_menu.as_mut() {
+                    menu.highlighted = selected;
+                }
+                open_session_menu_action(state);
+            } else {
+                state.session_menu = None;
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn open_session_menu_action(state: &mut HubState) {
+    let Some(menu) = state.session_menu.take() else {
+        return;
+    };
+    state.modal = Some(match menu.highlighted {
+        0 => SessionModal::Rename {
+            name: menu.session.clone(),
+            session: menu.session,
+            error: None,
+        },
+        _ => SessionModal::ConfirmClose {
+            session: menu.session,
+            error: None,
+        },
+    });
+}
+
+fn forward_input_to_session(
+    state: &mut HubState,
+    session: &str,
+    data: &[u8],
+    events: &[crate::raw_input::RawInputEvent],
+) -> Result<(), ClientError> {
+    if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events {
+        let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
+            return Ok(());
+        };
+        return write_to_session(
+            state,
+            session,
+            &ClientMessage::InputEvents {
+                events: vec![ClientInputEvent::Mouse {
+                    kind,
+                    column: mouse.column,
+                    row: mouse.row,
+                    modifiers: mouse.modifiers.bits(),
+                }],
+            },
+        );
+    }
+    write_to_session(
+        state,
+        session,
+        &ClientMessage::Input {
+            data: data.to_vec(),
+        },
+    )
+}
+
+fn write_to_session(
+    state: &mut HubState,
+    session: &str,
+    message: &ClientMessage,
+) -> Result<(), ClientError> {
+    if session == state.active.name {
+        return super::write_to_server(&mut state.active.stream, message)
+            .map_err(ClientError::ConnectionLost);
+    }
+    let stream = state
+        .session_mut(session)
+        .and_then(|session| session.sidebar_stream.as_mut())
+        .ok_or_else(|| {
+            ClientError::ConnectionLost(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("session {session} sidebar is not connected"),
+            ))
+        })?;
+    super::write_to_server(stream, message).map_err(ClientError::ConnectionLost)
+}
+
 fn handle_modal_input(
     backend: &mut impl SessionHubBackend,
     state: &mut HubState,
@@ -656,78 +988,216 @@ fn handle_modal_input(
                 state.modal = None;
                 return Ok(true);
             }
-            KeyCode::Backspace => {
-                if let Some(modal) = state.modal.as_mut() {
+            KeyCode::Backspace => match state.modal.as_mut() {
+                Some(SessionModal::Create(modal)) => {
                     modal.name.pop();
                     modal.error = None;
                 }
-            }
+                Some(SessionModal::Rename { name, error, .. }) => {
+                    name.pop();
+                    *error = None;
+                }
+                Some(SessionModal::ConfirmClose { .. }) | None => {}
+            },
             KeyCode::Enter => {
-                let requested = state
-                    .modal
-                    .as_ref()
-                    .map(|modal| modal.name.trim().to_owned())
-                    .unwrap_or_default();
-                let session = match crate::session::parse_target_name(&requested) {
-                    Ok(Some(session)) => session,
-                    Ok(None) => {
-                        set_modal_error(state, "use a named session, not default");
-                        continue;
-                    }
-                    Err(error) => {
-                        set_modal_error(state, error);
-                        continue;
-                    }
-                };
-                if state.sessions.iter().any(|item| item.name == session) {
-                    set_modal_error(state, format!("session {session} already exists"));
-                    continue;
+                submit_session_modal(backend, state, event_tx, should_quit.clone())?;
+                if state.modal.is_none() {
+                    return Ok(true);
                 }
-                if let Err(error) = backend.create_session(&session) {
-                    set_modal_error(state, error.to_string());
-                    continue;
-                }
-                state.sessions.push(HubSession {
-                    name: session.clone(),
-                    running: true,
-                    summary: None,
-                    summary_generation: 0,
-                    summary_stream: None,
-                });
-                state
-                    .sessions
-                    .sort_by(|left, right| left.name.cmp(&right.name));
-                connect_summary(backend, state, &session, event_tx, should_quit.clone())
-                    .map_err(ClientError::ConnectionFailed)?;
-                switch_active(
-                    backend,
-                    state,
-                    &session,
-                    event_tx,
-                    should_quit.clone(),
-                    None,
-                )
-                .map_err(ClientError::ConnectionFailed)?;
-                state.modal = None;
-                state.status = Some(format!("created session {session}"));
-                return Ok(true);
             }
             KeyCode::Char(ch)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(modal) = state.modal.as_mut() {
-                    if modal.name.len() < 64 {
+                match state.modal.as_mut() {
+                    Some(SessionModal::Create(modal)) if modal.name.len() < 64 => {
                         modal.name.push(ch);
                         modal.error = None;
                     }
+                    Some(SessionModal::Rename { name, error, .. }) if name.len() < 64 => {
+                        name.push(ch);
+                        *error = None;
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
     }
     Ok(true)
+}
+
+fn submit_session_modal(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    match state.modal.as_ref() {
+        Some(SessionModal::Create(modal)) => {
+            let requested = modal.name.trim().to_owned();
+            create_named_session(backend, state, event_tx, should_quit, requested)
+        }
+        Some(SessionModal::Rename { session, name, .. }) => {
+            let session = session.clone();
+            let requested = name.trim().to_owned();
+            rename_named_session(backend, state, event_tx, should_quit, &session, requested)
+        }
+        Some(SessionModal::ConfirmClose { session, .. }) => {
+            let session = session.clone();
+            close_named_session(backend, state, event_tx, should_quit, &session)
+        }
+        None => Ok(()),
+    }
+}
+
+fn validated_new_session_name(state: &mut HubState, requested: &str) -> Option<String> {
+    let session = match crate::session::parse_target_name(requested) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            set_modal_error(state, "use a named session, not default");
+            return None;
+        }
+        Err(error) => {
+            set_modal_error(state, error);
+            return None;
+        }
+    };
+    if state.sessions.iter().any(|item| item.name == session) {
+        set_modal_error(state, format!("session {session} already exists"));
+        return None;
+    }
+    Some(session)
+}
+
+fn create_named_session(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    requested: String,
+) -> Result<(), ClientError> {
+    let Some(session) = validated_new_session_name(state, &requested) else {
+        return Ok(());
+    };
+    if let Err(error) = backend.create_session(&session) {
+        set_modal_error(state, error.to_string());
+        return Ok(());
+    }
+    state.sessions.push(HubSession {
+        name: session.clone(),
+        running: true,
+        summary: None,
+        summary_generation: 0,
+        summary_stream: None,
+        sidebar_generation: 0,
+        sidebar_stream: None,
+        sidebar_frame: None,
+    });
+    state
+        .sessions
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    connect_summary(backend, state, &session, event_tx, should_quit.clone())
+        .map_err(ClientError::ConnectionFailed)?;
+    switch_active(backend, state, &session, event_tx, should_quit, None)
+        .map_err(ClientError::ConnectionFailed)?;
+    state.modal = None;
+    state.status = Some(format!("created session {session}"));
+    Ok(())
+}
+
+fn rename_named_session(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    session: &str,
+    requested: String,
+) -> Result<(), ClientError> {
+    if requested == session {
+        state.modal = None;
+        return Ok(());
+    }
+    let Some(new_name) = validated_new_session_name(state, &requested) else {
+        return Ok(());
+    };
+    detach_session_observers(state, session);
+    if let Err(error) = backend.rename_session(session, &new_name) {
+        set_modal_error(state, error.to_string());
+        return Ok(());
+    }
+    let was_active = state.active.name == session;
+    let was_collapsed = state.collapsed.remove(session);
+    if let Some(item) = state.session_mut(session) {
+        item.name = new_name.clone();
+        item.running = true;
+        item.summary = None;
+        item.summary_generation = 0;
+        item.sidebar_generation = 0;
+    }
+    if was_collapsed {
+        state.collapsed.insert(new_name.clone());
+    }
+    state
+        .sessions
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    connect_summary(backend, state, &new_name, event_tx, should_quit.clone())
+        .map_err(ClientError::ConnectionFailed)?;
+    if was_active {
+        switch_active(backend, state, &new_name, event_tx, should_quit, None)
+            .map_err(ClientError::ConnectionFailed)?;
+    } else if !was_collapsed {
+        connect_sidebar(backend, state, &new_name, event_tx, should_quit)
+            .map_err(ClientError::ConnectionFailed)?;
+    }
+    state.modal = None;
+    state.status = Some(format!("renamed session {session} to {new_name}"));
+    Ok(())
+}
+
+fn close_named_session(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    session: &str,
+) -> Result<(), ClientError> {
+    state.collapsed.insert(session.to_owned());
+    if state.active.name == session {
+        let fallback = state
+            .sessions
+            .iter()
+            .find(|item| item.name != session)
+            .map(|item| item.name.clone())
+            .ok_or_else(|| ClientError::ConnectionLost(io::Error::other("no fallback session")))?;
+        switch_active(backend, state, &fallback, event_tx, should_quit, None)
+            .map_err(ClientError::ConnectionFailed)?;
+    }
+    detach_session_observers(state, session);
+    if let Err(error) = backend.close_session(session) {
+        set_modal_error(state, error.to_string());
+        return Ok(());
+    }
+    state.sessions.retain(|item| item.name != session);
+    state.collapsed.remove(session);
+    state.modal = None;
+    state.status = Some(format!("closed session {session}"));
+    Ok(())
+}
+
+fn detach_session_observers(state: &mut HubState, session: &str) {
+    if let Some(item) = state.session_mut(session) {
+        if let Some(stream) = item.summary_stream.as_mut() {
+            let _ = super::write_to_server(stream, &ClientMessage::Detach);
+        }
+        if let Some(stream) = item.sidebar_stream.as_mut() {
+            let _ = super::write_to_server(stream, &ClientMessage::Detach);
+        }
+        item.summary_stream = None;
+        item.sidebar_stream = None;
+        item.sidebar_frame = None;
+    }
 }
 
 fn activate_row(
@@ -746,7 +1216,11 @@ fn activate_row(
                     .find(|item| item.name == session)
                     .is_some_and(|item| item.summary_stream.is_none());
                 if needs_connection {
-                    connect_summary(backend, state, &session, event_tx, should_quit)
+                    connect_summary(backend, state, &session, event_tx, should_quit.clone())
+                        .map_err(ClientError::ConnectionFailed)?;
+                }
+                if session != state.active.name {
+                    connect_sidebar(backend, state, &session, event_tx, should_quit)
                         .map_err(ClientError::ConnectionFailed)?;
                 }
                 return Ok(());
@@ -760,41 +1234,36 @@ fn activate_row(
                 connect_summary(backend, state, &session, event_tx, should_quit)
                     .map_err(ClientError::ConnectionFailed)?;
             } else {
-                state.collapsed.insert(session);
+                state.collapsed.insert(session.clone());
+                if let Some(hub_session) = state.session_mut(&session) {
+                    if let Some(stream) = hub_session.sidebar_stream.as_mut() {
+                        let _ = super::write_to_server(stream, &ClientMessage::Detach);
+                    }
+                    hub_session.sidebar_stream = None;
+                    hub_session.sidebar_frame = None;
+                    hub_session.sidebar_generation = 0;
+                }
             }
         }
-        HubRowTarget::Workspace {
-            session,
-            workspace_id,
-        } => {
-            if state.active.name != session {
-                switch_active(
-                    backend,
-                    state,
-                    &session,
-                    event_tx,
-                    should_quit,
-                    Some(&workspace_id),
-                )
-                .map_err(ClientError::ConnectionFailed)?;
-            } else {
-                backend
-                    .focus_workspace(&session, &workspace_id)
-                    .map_err(ClientError::ConnectionFailed)?;
-            }
-            state.status = None;
-        }
-        HubRowTarget::ActiveSidebarRow { .. } => {}
+        HubRowTarget::SpaceRow { .. } => {}
+        HubRowTarget::SpaceGapRow { .. } => {}
         HubRowTarget::NewSession => {
-            state.modal = Some(NewSessionModal::default());
+            state.modal = Some(SessionModal::Create(NewSessionModal {
+                name: String::new(),
+                error: None,
+            }));
         }
     }
     Ok(())
 }
 
 fn set_modal_error(state: &mut HubState, error: impl Into<String>) {
-    if let Some(modal) = state.modal.as_mut() {
-        modal.error = Some(error.into());
+    let error = Some(error.into());
+    match state.modal.as_mut() {
+        Some(SessionModal::Create(modal)) => modal.error = error,
+        Some(SessionModal::Rename { error: target, .. })
+        | Some(SessionModal::ConfirmClose { error: target, .. }) => *target = error,
+        None => {}
     }
 }
 
@@ -845,6 +1314,55 @@ fn connect_summary(
     Ok(())
 }
 
+fn connect_sidebar(
+    backend: &mut impl SessionHubBackend,
+    state: &mut HubState,
+    session: &str,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+) -> io::Result<()> {
+    if session == state.active.name
+        || state
+            .sessions
+            .iter()
+            .find(|item| item.name == session)
+            .is_some_and(|item| item.sidebar_stream.is_some())
+    {
+        return Ok(());
+    }
+    let generation = state.next_generation;
+    state.next_generation = state.next_generation.saturating_add(1);
+    let mut stream = backend.connect_client(session)?;
+    super::do_handshake_with_options(
+        &mut stream,
+        state.cols,
+        state.rows,
+        0,
+        0,
+        RenderEncoding::SemanticFrame,
+        state.keybindings.clone(),
+        ClientLaunchMode::AppSidebar,
+        super::REMOTE_HANDSHAKE_READ_TIMEOUT,
+    )
+    .map_err(io::Error::other)?;
+    let read_stream = stream.try_clone()?;
+    spawn_hub_reader(
+        read_stream,
+        event_tx.clone(),
+        session.to_owned(),
+        generation,
+        HubStreamKind::Sidebar,
+        should_quit,
+    );
+    if let Some(hub_session) = state.session_mut(session) {
+        hub_session.running = true;
+        hub_session.sidebar_generation = generation;
+        hub_session.sidebar_stream = Some(stream);
+        hub_session.sidebar_frame = None;
+    }
+    Ok(())
+}
+
 fn switch_active(
     backend: &mut impl SessionHubBackend,
     state: &mut HubState,
@@ -853,6 +1371,14 @@ fn switch_active(
     should_quit: Arc<AtomicBool>,
     workspace_id: Option<&str>,
 ) -> io::Result<()> {
+    if let Some(target) = state.session_mut(session) {
+        if let Some(stream) = target.sidebar_stream.as_mut() {
+            let _ = super::write_to_server(stream, &ClientMessage::Detach);
+        }
+        target.sidebar_stream = None;
+        target.sidebar_frame = None;
+        target.sidebar_generation = 0;
+    }
     let generation = state.next_generation;
     state.next_generation = state.next_generation.saturating_add(1);
     let active = connect_active(
@@ -870,10 +1396,17 @@ fn switch_active(
         session.to_owned(),
         generation,
         HubStreamKind::App,
-        should_quit,
+        should_quit.clone(),
     );
     let mut previous = std::mem::replace(&mut state.active, active);
+    let previous_name = previous.name.clone();
     let _ = super::write_to_server(&mut previous.stream, &ClientMessage::Detach);
+    if previous_name != session
+        && !state.collapsed.contains(&previous_name)
+        && state.sessions.iter().any(|item| item.name == previous_name)
+    {
+        connect_sidebar(backend, state, &previous_name, event_tx, should_quit)?;
+    }
     state.repaint = true;
     Ok(())
 }
@@ -923,7 +1456,7 @@ fn spawn_hub_reader(
     std::thread::spawn(move || {
         let _ = stream.set_nonblocking(false);
         let max_frame_size = match stream_kind {
-            HubStreamKind::App => MAX_RENDER_FRAME_SIZE,
+            HubStreamKind::App | HubStreamKind::Sidebar => MAX_RENDER_FRAME_SIZE,
             HubStreamKind::Summary => MAX_FRAME_SIZE,
         };
         while !should_quit.load(Ordering::Acquire) {
@@ -973,6 +1506,11 @@ fn render_hub(
 }
 
 fn compose_frame(state: &HubState) -> FrameData {
+    if let Some(session) = state.server_overlay_session.as_deref() {
+        if let Some(frame) = state.session_frame(session) {
+            return frame.clone();
+        }
+    }
     let Some(original) = state.active.frame.as_ref() else {
         return FrameData::from_ratatui_buffer_with_hyperlinks(
             &Buffer::empty(Rect::new(0, 0, state.cols, state.rows)),
@@ -1013,13 +1551,6 @@ fn compose_frame(state: &HubState) -> FrameData {
     for row in state.rows() {
         match row.target {
             HubRowTarget::Session(name) => {
-                let status = state
-                    .sessions
-                    .iter()
-                    .find(|session| session.name == name)
-                    .and_then(|session| session.summary.as_ref())
-                    .map(aggregate_status)
-                    .unwrap_or(AgentStatus::Unknown);
                 let marker = if state.collapsed.contains(&name) {
                     "▶"
                 } else {
@@ -1030,48 +1561,38 @@ fn compose_frame(state: &HubState) -> FrameData {
                     0,
                     row.y,
                     sidebar_width.saturating_sub(1),
-                    &format!(" {marker} {name} {}", status_symbol(status)),
+                    &format!(" {marker} {name}"),
                     &heading,
                 );
             }
-            HubRowTarget::Workspace {
+            HubRowTarget::SpaceRow {
                 session,
-                workspace_id,
+                workspace_id: _,
+                original_y,
             } => {
-                if let Some(workspace) = state
-                    .sessions
-                    .iter()
-                    .find(|item| item.name == session)
-                    .and_then(|item| item.summary.as_ref())
-                    .and_then(|summary| {
-                        summary
-                            .workspaces
-                            .iter()
-                            .find(|workspace| workspace.workspace_id == workspace_id)
-                    })
-                {
-                    write_frame_text(
+                if let Some(source) = state.session_frame(&session) {
+                    copy_frame_row(
+                        source,
                         &mut frame,
-                        0,
+                        original_y,
                         row.y,
                         sidebar_width.saturating_sub(1),
-                        &format!(
-                            "   └─ {} {}",
-                            workspace.label,
-                            status_symbol(workspace.agent_status)
-                        ),
-                        &blank,
                     );
                 }
             }
-            HubRowTarget::ActiveSidebarRow { original_y } => {
-                copy_frame_row(
-                    original,
-                    &mut frame,
-                    original_y,
-                    row.y,
-                    sidebar_width.saturating_sub(1),
-                );
+            HubRowTarget::SpaceGapRow {
+                session,
+                original_y,
+            } => {
+                if let Some(source) = state.session_frame(&session) {
+                    copy_frame_row(
+                        source,
+                        &mut frame,
+                        original_y,
+                        row.y,
+                        sidebar_width.saturating_sub(1),
+                    );
+                }
             }
             HubRowTarget::NewSession => write_frame_text(
                 &mut frame,
@@ -1084,8 +1605,11 @@ fn compose_frame(state: &HubState) -> FrameData {
         }
     }
 
+    if state.session_menu.is_some() {
+        overlay_session_context_menu(&mut frame, state);
+    }
     if let Some(modal) = &state.modal {
-        overlay_new_session_modal(&mut frame, modal);
+        overlay_session_modal(&mut frame, modal);
     }
     frame
 }
@@ -1138,9 +1662,61 @@ fn copy_frame_row(
     }
 }
 
-fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
+fn overlay_session_context_menu(frame: &mut FrameData, state: &HubState) {
+    let Some(menu) = state.session_menu.as_ref() else {
+        return;
+    };
+    let Some(rect) = session_menu_rect(state) else {
+        return;
+    };
+    let area = Rect::new(0, 0, frame.width, frame.height);
+    let mut overlay = Buffer::empty(area);
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .render(rect, &mut overlay);
+    for (index, label) in ["Rename", "Close"].iter().enumerate() {
+        let style = if index == menu.highlighted {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Black)
+        };
+        Paragraph::new(format!(" {label}")).style(style).render(
+            Rect::new(rect.x + 1, rect.y + 1 + index as u16, rect.width - 2, 1),
+            &mut overlay,
+        );
+    }
+    blit_overlay(frame, &overlay, rect);
+}
+
+fn overlay_session_modal(frame: &mut FrameData, modal: &SessionModal) {
+    let (title, input, message, error) = match modal {
+        SessionModal::Create(modal) => (
+            " New named session ",
+            Some(modal.name.as_str()),
+            "Enter create  Esc cancel".to_owned(),
+            modal.error.as_deref(),
+        ),
+        SessionModal::Rename {
+            session,
+            name,
+            error,
+        } => (
+            " Rename named session ",
+            Some(name.as_str()),
+            format!("Renaming {session} stops and restores its saved state"),
+            error.as_deref(),
+        ),
+        SessionModal::ConfirmClose { session, error } => (
+            " Close named session ",
+            None,
+            format!("Close {session}? Enter confirms; Esc cancels"),
+            error.as_deref(),
+        ),
+    };
     let width = frame.width.saturating_sub(4).clamp(20, 52);
-    let height = if modal.error.is_some() { 7 } else { 6 };
+    let height = if error.is_some() { 7 } else { 6 };
     let rect = Rect::new(
         frame.width.saturating_sub(width) / 2,
         frame.height.saturating_sub(height) / 2,
@@ -1150,24 +1726,25 @@ fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
     let area = Rect::new(0, 0, frame.width, frame.height);
     let mut overlay = Buffer::empty(area);
     Block::default()
-        .title(" New named session ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().fg(Color::White).bg(Color::Black))
         .render(rect, &mut overlay);
-    let input = format!("Name: {}_", modal.name);
-    Paragraph::new(input)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
-        .render(
-            Rect::new(
-                rect.x.saturating_add(2),
-                rect.y.saturating_add(2),
-                rect.width.saturating_sub(4),
-                1,
-            ),
-            &mut overlay,
-        );
-    Paragraph::new("Enter create  Esc cancel")
+    if let Some(input) = input {
+        Paragraph::new(format!("Name: {input}_"))
+            .style(Style::default().fg(Color::White).bg(Color::Black))
+            .render(
+                Rect::new(
+                    rect.x.saturating_add(2),
+                    rect.y.saturating_add(2),
+                    rect.width.saturating_sub(4),
+                    1,
+                ),
+                &mut overlay,
+            );
+    }
+    Paragraph::new(clip(&message, rect.width.saturating_sub(4) as usize))
         .style(Style::default().fg(Color::DarkGray).bg(Color::Black))
         .render(
             Rect::new(
@@ -1178,7 +1755,7 @@ fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
             ),
             &mut overlay,
         );
-    if let Some(error) = &modal.error {
+    if let Some(error) = error {
         Paragraph::new(clip(error, rect.width.saturating_sub(4) as usize))
             .style(Style::default().fg(Color::Red).bg(Color::Black))
             .render(
@@ -1191,7 +1768,21 @@ fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
                 &mut overlay,
             );
     }
-    let overlay_frame = FrameData::from_ratatui_buffer_with_hyperlinks(&overlay, None, &[]);
+    blit_overlay(frame, &overlay, rect);
+    frame.cursor = input.map(|input| crate::protocol::CursorState {
+        x: rect
+            .x
+            .saturating_add(8)
+            .saturating_add(input.chars().count() as u16)
+            .min(rect.x.saturating_add(rect.width.saturating_sub(2))),
+        y: rect.y.saturating_add(2),
+        visible: true,
+        shape: 6,
+    });
+}
+
+fn blit_overlay(frame: &mut FrameData, overlay: &Buffer, rect: Rect) {
+    let overlay_frame = FrameData::from_ratatui_buffer_with_hyperlinks(overlay, None, &[]);
     for y in rect.y..rect.y.saturating_add(rect.height) {
         for x in rect.x..rect.x.saturating_add(rect.width) {
             let index = y as usize * frame.width as usize + x as usize;
@@ -1201,41 +1792,6 @@ fn overlay_new_session_modal(frame: &mut FrameData, modal: &NewSessionModal) {
                 *target = source.clone();
             }
         }
-    }
-    frame.cursor = Some(crate::protocol::CursorState {
-        x: rect
-            .x
-            .saturating_add(8)
-            .saturating_add(modal.name.chars().count() as u16)
-            .min(rect.x.saturating_add(rect.width.saturating_sub(2))),
-        y: rect.y.saturating_add(2),
-        visible: true,
-        shape: 6,
-    });
-}
-
-fn aggregate_status(summary: &SessionSummary) -> AgentStatus {
-    summary
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.agent_status)
-        .max_by_key(|status| match status {
-            AgentStatus::Blocked => 5,
-            AgentStatus::Done => 4,
-            AgentStatus::Working => 3,
-            AgentStatus::Idle => 2,
-            AgentStatus::Unknown => 1,
-        })
-        .unwrap_or(AgentStatus::Unknown)
-}
-
-fn status_symbol(status: AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Blocked => "!",
-        AgentStatus::Done => "●",
-        AgentStatus::Working => "◆",
-        AgentStatus::Idle => "·",
-        AgentStatus::Unknown => "?",
     }
 }
 
@@ -1277,27 +1833,5 @@ mod tests {
                 assert_eq!(composed.cells[index], source.cells[index]);
             }
         }
-    }
-
-    #[test]
-    fn aggregate_status_prioritises_attention() {
-        let summary = SessionSummary {
-            workspaces: vec![
-                crate::protocol::SessionWorkspaceSummary {
-                    workspace_id: "1".into(),
-                    label: "one".into(),
-                    focused: true,
-                    agent_status: AgentStatus::Working,
-                },
-                crate::protocol::SessionWorkspaceSummary {
-                    workspace_id: "2".into(),
-                    label: "two".into(),
-                    focused: false,
-                    agent_status: AgentStatus::Blocked,
-                },
-            ],
-            sidebar: None,
-        };
-        assert_eq!(aggregate_status(&summary), AgentStatus::Blocked);
     }
 }

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -74,6 +74,8 @@ pub enum ClientLaunchMode {
     AppDirectGraphics,
     /// Full app client rendered without Herdr's server-owned sidebar.
     AppEmbedded,
+    /// Passive full-sidebar app renderer that never owns foreground state.
+    AppSidebar,
     /// Lightweight client that receives workspace summaries instead of frames.
     SessionSummary,
     /// Direct terminal attach client.
@@ -661,6 +663,7 @@ pub struct SessionSidebarSummary {
 pub struct SessionSummary {
     pub workspaces: Vec<SessionWorkspaceSummary>,
     pub sidebar: Option<SessionSidebarSummary>,
+    pub overlay_active: bool,
 }
 
 impl FrameData {

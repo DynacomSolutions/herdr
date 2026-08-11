@@ -1447,6 +1447,7 @@ new_tab = "ctrl+notakey"
     fn handshake_preserves_session_hub_launch_modes() {
         for launch_mode in [
             ClientLaunchMode::AppEmbedded,
+            ClientLaunchMode::AppSidebar,
             ClientLaunchMode::SessionSummary,
         ] {
             let (mut client_stream, server_stream, _path) =

@@ -316,6 +316,30 @@ pub fn delete_session(name: &str) -> Result<SessionInfo, String> {
     }
 }
 
+pub fn rename_session(name: &str, new_name: &str) -> Result<SessionInfo, String> {
+    if name == DEFAULT_SESSION_NAME || new_name == DEFAULT_SESSION_NAME {
+        return Err("renaming the default session is not supported".to_string());
+    }
+    validate_name(name)?;
+    validate_name(new_name)?;
+    if name == new_name {
+        return Err("new session name must be different".to_string());
+    }
+    let source = data_dir_for(Some(name));
+    if !source.is_dir() {
+        return Err(format!("session {name} does not exist"));
+    }
+    let destination = data_dir_for(Some(new_name));
+    if destination.exists() {
+        return Err(format!("session {new_name} already exists"));
+    }
+    if is_running_at(&api_socket_path_for(Some(name))) {
+        stop_session(Some(name))?;
+    }
+    std::fs::rename(&source, &destination).map_err(|err| err.to_string())?;
+    Ok(session_info(Some(new_name)))
+}
+
 fn send_stop_request(
     mut stream: LocalStream,
     request: &serde_json::Value,
@@ -1031,6 +1055,31 @@ mod tests {
     #[test]
     fn delete_default_session_is_rejected() {
         assert!(delete_session(DEFAULT_SESSION_NAME).is_err());
+    }
+
+    #[test]
+    fn rename_session_moves_persisted_state() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-session-rename-{}", std::process::id()));
+        let sessions_dir = config_home
+            .join(crate::config::app_dir_name())
+            .join("sessions");
+        let source = sessions_dir.join("old");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("state.json"), "state").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        let renamed = rename_session("old", "new").unwrap();
+
+        assert_eq!(renamed.name, "new");
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(sessions_dir.join("new/state.json")).unwrap(),
+            "state"
+        );
+        std::fs::remove_dir_all(&config_home).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

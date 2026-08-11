@@ -2971,6 +2971,10 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .is_some_and(ClientConnection::is_full_app_client);
+        let source_is_sidebar_observer = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| matches!(client.mode, ClientConnectionMode::AppSidebar));
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
@@ -3001,7 +3005,7 @@ impl HeadlessServer {
         }
         let events = events_for_app_routing(events, source_was_foreground, source_is_full_app);
         let interaction = events_include_interaction(&events);
-        let foreground_changed = if interaction {
+        let foreground_changed = if interaction && !source_is_sidebar_observer {
             self.promote_client_to_foreground(client_id)
         } else {
             false
@@ -3078,6 +3082,9 @@ impl HeadlessServer {
                     }
                     crate::protocol::ClientLaunchMode::AppEmbedded => {
                         ClientConnectionMode::AppEmbedded
+                    }
+                    crate::protocol::ClientLaunchMode::AppSidebar => {
+                        ClientConnectionMode::AppSidebar
                     }
                     crate::protocol::ClientLaunchMode::SessionSummary => {
                         ClientConnectionMode::SessionSummary
@@ -4172,6 +4179,9 @@ impl HeadlessServer {
                 {
                     has_app_target = true;
                 }
+                ClientConnectionMode::AppSidebar => {
+                    has_app_target = true;
+                }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
                     direct_terminal_targets.insert(terminal_id.as_str());
@@ -4298,7 +4308,9 @@ impl HeadlessServer {
                         | ClientConnectionMode::TerminalObserve { terminal_id } => {
                             dirty_terminal_ids.contains(terminal_id.as_str())
                         }
-                        ClientConnectionMode::App | ClientConnectionMode::AppEmbedded => true,
+                        ClientConnectionMode::App
+                        | ClientConnectionMode::AppEmbedded
+                        | ClientConnectionMode::AppSidebar => true,
                         ClientConnectionMode::SessionSummary => false,
                     })
                     .collect();
@@ -4318,7 +4330,9 @@ impl HeadlessServer {
         };
         if !matches!(
             mode,
-            ClientConnectionMode::App | ClientConnectionMode::AppEmbedded
+            ClientConnectionMode::App
+                | ClientConnectionMode::AppEmbedded
+                | ClientConnectionMode::AppSidebar
         ) {
             retained_fallback!("not_app_client");
         }
@@ -4540,11 +4554,15 @@ impl HeadlessServer {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(
                 mode,
-                ClientConnectionMode::App | ClientConnectionMode::AppEmbedded
+                ClientConnectionMode::App
+                    | ClientConnectionMode::AppEmbedded
+                    | ClientConnectionMode::AppSidebar
             );
             let embedded_app_client = matches!(mode, ClientConnectionMode::AppEmbedded);
             let mut frame = match mode {
-                ClientConnectionMode::App | ClientConnectionMode::AppEmbedded => {
+                ClientConnectionMode::App
+                | ClientConnectionMode::AppEmbedded
+                | ClientConnectionMode::AppSidebar => {
                     let embedded = embedded_app_client;
                     let render_started = crate::render_prof::timer();
                     let render_cell_size =
@@ -8725,6 +8743,31 @@ next_tab = ""
             }],
         }));
         assert_eq!(server.foreground_client_id, Some(3));
+    }
+
+    #[tokio::test]
+    async fn sidebar_observer_input_does_not_take_foreground() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        let mut sidebar = test_app_client(None, 2);
+        sidebar.mode = ClientConnectionMode::AppSidebar;
+        server.clients.insert(2, sidebar);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Release,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(server.foreground_client_id, Some(1));
     }
 
     #[test]

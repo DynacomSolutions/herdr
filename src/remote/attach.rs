@@ -403,6 +403,75 @@ impl crate::client::SessionHubBackend for RemoteSessionHub {
         });
         Ok(())
     }
+
+    fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()> {
+        crate::session::parse_target_name(session).map_err(io::Error::other)?;
+        crate::session::parse_target_name(new_name).map_err(io::Error::other)?;
+        if session == crate::session::DEFAULT_SESSION_NAME
+            || new_name == crate::session::DEFAULT_SESSION_NAME
+        {
+            return Err(io::Error::other("the default session cannot be renamed"));
+        }
+        if self.sessions.iter().any(|item| item.name == new_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {new_name} already exists"),
+            ));
+        }
+        self.bridges.remove(session);
+        let command = format!(
+            "{} session rename {} {} --json",
+            self.remote_herdr.shell_path,
+            shell_quote(session),
+            shell_quote(new_name)
+        );
+        let output = self.ssh.user_shell_output(&command)?;
+        if !output.status.success() {
+            return Err(command_failed("remote session rename failed", &output));
+        }
+        if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
+            item.name = new_name.to_owned();
+            item.running = false;
+        }
+        Ok(())
+    }
+
+    fn close_session(&mut self, session: &str) -> io::Result<()> {
+        if session == crate::session::DEFAULT_SESSION_NAME {
+            return Err(io::Error::other("the default session cannot be closed"));
+        }
+        let running = self
+            .sessions
+            .iter()
+            .find(|item| item.name == session)
+            .is_some_and(|item| item.running);
+        self.bridges.remove(session);
+        if running {
+            let stop = format!(
+                "{} session stop {} --json",
+                self.remote_herdr.shell_path,
+                shell_quote(session)
+            );
+            let output = self.ssh.user_shell_output(&stop)?;
+            if !output.status.success() {
+                return Err(command_failed("remote session stop failed", &output));
+            }
+            if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
+                item.running = false;
+            }
+        }
+        let delete = format!(
+            "{} session delete {} --json",
+            self.remote_herdr.shell_path,
+            shell_quote(session)
+        );
+        let output = self.ssh.user_shell_output(&delete)?;
+        if !output.status.success() {
+            return Err(command_failed("remote session delete failed", &output));
+        }
+        self.sessions.retain(|item| item.name != session);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

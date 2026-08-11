@@ -9,6 +9,7 @@ use crate::server::render_stream::ClientRenderState;
 pub(crate) enum ClientConnectionMode {
     App,
     AppEmbedded,
+    AppSidebar,
     SessionSummary,
     TerminalAttach { terminal_id: String },
     TerminalObserve { terminal_id: String },
@@ -302,6 +303,7 @@ pub(crate) fn render_targets(
         .filter(|(_, client)| {
             client.writer.is_some()
                 && (client.is_full_app_client()
+                    || matches!(client.mode, ClientConnectionMode::AppSidebar)
                     || matches!(
                         client.mode,
                         ClientConnectionMode::TerminalAttach { .. }
