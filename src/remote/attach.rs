@@ -205,7 +205,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             sessions,
             bridges: HashMap::new(),
         };
-        return crate::client::run_remote_session_hub(&mut hub, &session_name, keybindings);
+        crate::client::run_remote_session_hub(&mut hub, &session_name, keybindings)
     }
 
     #[cfg(windows)]
@@ -275,7 +275,9 @@ fn ensure_remote_named_sessions_ready(
     remote_binary_changed: bool,
     live_handoff_enabled: bool,
 ) -> io::Result<()> {
-    for session in sessions.iter().filter(|session| session.running) {
+    for session in sessions.iter().filter(|session| {
+        session.running && session.name != crate::session::DEFAULT_SESSION_NAME
+    }) {
         let RemoteServerStatus::Running {
             version,
             protocol,
@@ -1844,7 +1846,7 @@ fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> Stri
     command
 }
 
-#[cfg(test)]
+#[cfg(any(windows, test))]
 fn reattach_command(
     program: &str,
     target: &str,
@@ -2339,6 +2341,7 @@ fn copy_local_stream_to_writer<W: io::Write>(
     Ok(total)
 }
 
+#[cfg(windows)]
 fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,

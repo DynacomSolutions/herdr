@@ -164,7 +164,7 @@ pub(crate) fn run_remote_session_hub(
             None
         }
     };
-    let (cols, rows, _, _) = super::initial_terminal_geometry(false);
+    let (cols, rows, _, _, _) = super::initial_terminal_geometry(false);
 
     let mut descriptors = backend.sessions().to_vec();
     if !descriptors
@@ -277,13 +277,31 @@ async fn run_hub_loop(
 ) -> Result<(), ClientError> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     let host_mouse_capture_active = Arc::new(AtomicBool::new(mouse_capture));
+    let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
     let reported_cell_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
     let stdin_mouse_capture = host_mouse_capture_active.clone();
+    let stdin_sgr_pixels = host_sgr_pixels_active.clone();
+    let stdin_direct_response = Arc::new(std::sync::Mutex::new(
+        super::direct_graphics::ResponseMatcher::default(),
+    ));
+    let stdin_direct_response_active = stdin_direct_response
+        .lock()
+        .map(|matcher| matcher.active_handle())
+        .unwrap_or_default();
     std::thread::spawn(move || {
-        super::input::stdin_reader_loop(stdin_tx, &stdin_quit, false, false, stdin_mouse_capture);
+        super::input::stdin_reader_loop(
+            stdin_tx,
+            &stdin_quit,
+            false,
+            false,
+            stdin_mouse_capture,
+            stdin_sgr_pixels,
+            stdin_direct_response,
+            stdin_direct_response_active,
+        );
     });
 
     let resize_quit = should_quit.clone();
@@ -372,6 +390,7 @@ async fn run_hub_loop(
                         state,
                         super::decompress_server_message(message)?,
                         &host_mouse_capture_active,
+                        &host_sgr_pixels_active,
                         redraw_on_focus_gained,
                     )?;
                 }
@@ -412,7 +431,10 @@ async fn run_hub_loop(
                 HubStreamKind::App => {}
             },
             ClientLoopEvent::Timer => {}
-            ClientLoopEvent::ServerMessage(_) | ClientLoopEvent::ServerDisconnected => {}
+            ClientLoopEvent::ServerMessage(_)
+            | ClientLoopEvent::ServerDisconnected
+            | ClientLoopEvent::PixelMouse(_, _)
+            | ClientLoopEvent::DirectGraphicsResponse(_) => {}
         }
 
         if state.repaint {
@@ -428,6 +450,7 @@ fn handle_active_message(
     state: &mut HubState,
     message: ServerMessage,
     host_mouse_capture_active: &Arc<AtomicBool>,
+    host_sgr_pixels_active: &Arc<AtomicBool>,
     _redraw_on_focus_gained: bool,
 ) -> Result<(), ClientError> {
     match message {
@@ -444,10 +467,18 @@ fn handle_active_message(
             super::handle_notify(kind, &message, body.as_deref(), &sound);
         }
         ServerMessage::Clipboard { data } => super::forward_clipboard(&data),
-        ServerMessage::WindowTitle { title } => super::write_window_title(title.as_deref()),
+        ServerMessage::WindowTitle { title } => {
+            let _ =
+                crate::terminal_effects::write_window_title(&mut io::stdout(), title.as_deref());
+        }
         ServerMessage::MouseCapture { enabled, .. } => {
-            super::set_mouse_capture(enabled).map_err(ClientError::ConnectionFailed)?;
+            // The local hub owns a cell-width sidebar, so keep host mouse reports
+            // in cell coordinates where the content offset can be translated.
+            let next_sgr_pixels = false;
+            super::set_mouse_capture(enabled, next_sgr_pixels)
+                .map_err(ClientError::ConnectionFailed)?;
             host_mouse_capture_active.store(enabled, Ordering::Release);
+            host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
         }
         ServerMessage::ServerShutdown { reason } => {
             state.status = Some(reason.unwrap_or_else(|| "session stopped".to_owned()));

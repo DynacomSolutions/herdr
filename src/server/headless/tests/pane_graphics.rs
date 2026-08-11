@@ -252,8 +252,7 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         cell_height_px: 20,
         render_encoding: RenderEncoding::SemanticFrame,
         keybindings: None,
-        direct_attach_requested: false,
-        direct_graphics: true,
+        launch_mode: crate::protocol::ClientLaunchMode::AppDirectGraphics,
         writer,
     }));
 
