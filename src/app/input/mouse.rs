@@ -1061,11 +1061,7 @@ impl AppState {
                         .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
                     self.context_menu = Some(ContextMenuState {
                         kind,
-                        x: self
-                            .view
-                            .sidebar_rect
-                            .x
-                            .saturating_add(self.view.sidebar_rect.width),
+                        x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
                     });
@@ -2138,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_context_menu_opens_beside_sidebar() {
+    fn workspace_context_menu_opens_at_click_position() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
@@ -2146,16 +2142,11 @@ mod tests {
         app.state.mode = Mode::Terminal;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let card = app.state.view.workspace_card_areas[0].rect;
-        let sidebar_right = app
-            .state
-            .view
-            .sidebar_rect
-            .x
-            .saturating_add(app.state.view.sidebar_rect.width);
+        let click_x = card.x + 1;
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Right),
-            card.x + 1,
+            click_x,
             card.y,
         ));
 
@@ -2165,8 +2156,14 @@ mod tests {
             ContextMenuKind::Workspace { ws_idx: 0 }
                 | ContextMenuKind::GitWorkspace { ws_idx: 0, .. }
         ));
-        assert_eq!(menu.x, sidebar_right);
-        assert_eq!(app.state.context_menu_rect().unwrap().x, sidebar_right);
+        assert_eq!(menu.x, click_x);
+        assert_eq!(app.state.context_menu_rect().unwrap().x, click_x);
+        let menu_rect = app.state.context_menu_rect().unwrap();
+        let overlay = app.session_summary().overlay.expect("context menu overlay");
+        assert_eq!(
+            Rect::new(overlay.x, overlay.y, overlay.width, overlay.height),
+            menu_rect
+        );
     }
 
     #[tokio::test]

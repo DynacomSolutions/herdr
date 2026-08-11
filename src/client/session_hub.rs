@@ -22,6 +22,12 @@ use crate::protocol::{
 
 use super::{ClientError, ClientLoopEvent};
 
+const NEW_SESSION_LABEL: &str = "+ new named session";
+
+fn new_session_label_hit(column: u16) -> bool {
+    column >= 1 && column < 1 + NEW_SESSION_LABEL.len() as u16
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteSessionDescriptor {
     pub(crate) name: String,
@@ -228,6 +234,12 @@ struct SessionContextMenu {
     highlighted: usize,
 }
 
+#[derive(Default)]
+struct ServerOverlayPlacement {
+    delta_x: i32,
+    delta_y: i32,
+}
+
 struct HubState {
     sessions: Vec<HubSession>,
     collapsed: HashSet<String>,
@@ -244,6 +256,7 @@ struct HubState {
     remote_image_paste_key: Option<(crossterm::event::KeyCode, KeyModifiers)>,
     server_overlay_session: Option<String>,
     server_overlay_seen: bool,
+    server_overlay_placement: Option<ServerOverlayPlacement>,
 }
 
 impl HubState {
@@ -382,6 +395,22 @@ impl HubState {
             .iter()
             .find(|session| session.name == name)
             .and_then(|session| session.sidebar_frame.as_ref())
+    }
+
+    fn session_overlay_rect(&self, name: &str) -> Option<Rect> {
+        let overlay = self
+            .sessions
+            .iter()
+            .find(|session| session.name == name)?
+            .summary
+            .as_ref()?
+            .overlay?;
+        Some(Rect::new(
+            overlay.x,
+            overlay.y,
+            overlay.width,
+            overlay.height,
+        ))
     }
 }
 
@@ -528,6 +557,7 @@ fn create_hub_state(
         remote_image_paste_key,
         server_overlay_session: None,
         server_overlay_seen: false,
+        server_overlay_placement: None,
     };
     if let Some(session) = state.session_mut(initial_session) {
         session.running = true;
@@ -852,10 +882,14 @@ fn apply_hub_summary(state: &mut HubState, session: &str, generation: u64, messa
         } else if overlay_is_owned && overlay_was_seen && !overlay_active {
             state.server_overlay_session = None;
             state.server_overlay_seen = false;
+            state.server_overlay_placement = None;
         } else if state.server_overlay_session.is_none()
             && session == state.active.name
             && overlay_active
         {
+            state
+                .server_overlay_placement
+                .get_or_insert_with(ServerOverlayPlacement::default);
             state.server_overlay_session = Some(session.to_owned());
             state.server_overlay_seen = true;
         }
@@ -1298,10 +1332,15 @@ fn handle_local_input(
                             modifiers: mouse.modifiers.bits(),
                         }],
                     };
+                    let overlay_placement = menu_open.then(|| ServerOverlayPlacement {
+                        delta_x: 0,
+                        delta_y: i32::from(mouse.row) - i32::from(original_y),
+                    });
                     write_to_session(state, &session, &message)?;
                     if menu_open {
                         state.server_overlay_session = Some(session);
                         state.server_overlay_seen = false;
+                        state.server_overlay_placement = overlay_placement;
                     }
                     return Ok(false);
                 }
@@ -1337,6 +1376,20 @@ fn handle_local_input(
                     });
                     return Ok(true);
                 }
+                Some(HubRowTarget::NewSession) if new_session_label_hit(mouse.column) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        activate_row(
+                            backend,
+                            state,
+                            event_tx,
+                            should_quit,
+                            HubRowTarget::NewSession,
+                        )?;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                Some(HubRowTarget::NewSession) => {}
                 Some(target) => {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         activate_row(backend, state, event_tx, should_quit, target)?;
@@ -1485,14 +1538,15 @@ fn forward_input_to_session(
         let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
             return Ok(());
         };
+        let (column, row) = translate_server_overlay_mouse(state, session, mouse.column, mouse.row);
         return write_to_session(
             state,
             session,
             &ClientMessage::InputEvents {
                 events: vec![ClientInputEvent::Mouse {
                     kind,
-                    column: mouse.column,
-                    row: mouse.row,
+                    column,
+                    row,
                     modifiers: mouse.modifiers.bits(),
                 }],
             },
@@ -2066,10 +2120,7 @@ fn render_hub(
 }
 
 fn compose_frame(state: &HubState) -> FrameData {
-    let original = match state.server_overlay_session.as_deref() {
-        Some(session) => state.session_frame(session),
-        None => state.active.frame.as_ref(),
-    };
+    let original = state.active.frame.as_ref();
     let Some(original) = original else {
         return FrameData::from_ratatui_buffer_with_hyperlinks(
             &Buffer::empty(Rect::new(0, 0, state.cols, state.rows)),
@@ -2158,9 +2209,17 @@ fn compose_frame(state: &HubState) -> FrameData {
                 1,
                 row.y,
                 sidebar_width.saturating_sub(2),
-                "+ new named session",
+                NEW_SESSION_LABEL,
                 &heading,
             ),
+        }
+    }
+
+    if let Some(session) = state.server_overlay_session.as_deref() {
+        if let Some((source_rect, target_rect)) = server_overlay_rects(state, session) {
+            if let Some(source_frame) = state.session_frame(session) {
+                copy_frame_rect(source_frame, &mut frame, source_rect, target_rect);
+            }
         }
     }
 
@@ -2171,6 +2230,54 @@ fn compose_frame(state: &HubState) -> FrameData {
         overlay_session_modal(&mut frame, modal);
     }
     frame
+}
+
+fn server_overlay_rects(state: &HubState, session: &str) -> Option<(Rect, Rect)> {
+    let placement = state.server_overlay_placement.as_ref()?;
+    let source = state.session_frame(session)?;
+    let source_rect = state.session_overlay_rect(session)?;
+    let target_rect = offset_rect(
+        source_rect,
+        placement.delta_x,
+        placement.delta_y,
+        source.width,
+        source.height,
+    );
+    Some((source_rect, target_rect))
+}
+
+fn offset_rect(rect: Rect, delta_x: i32, delta_y: i32, width: u16, height: u16) -> Rect {
+    let max_x = width.saturating_sub(rect.width);
+    let max_y = height.saturating_sub(rect.height);
+    let x = (i32::from(rect.x) + delta_x).clamp(0, i32::from(max_x)) as u16;
+    let y = (i32::from(rect.y) + delta_y).clamp(0, i32::from(max_y)) as u16;
+    Rect::new(x, y, rect.width.min(width), rect.height.min(height))
+}
+
+fn translate_server_overlay_mouse(
+    state: &HubState,
+    session: &str,
+    column: u16,
+    row: u16,
+) -> (u16, u16) {
+    let Some((source, target)) = server_overlay_rects(state, session) else {
+        return (column, row);
+    };
+    translate_overlay_point(source, target, column, row)
+}
+
+fn translate_overlay_point(source: Rect, target: Rect, column: u16, row: u16) -> (u16, u16) {
+    if column < target.x
+        || column >= target.x.saturating_add(target.width)
+        || row < target.y
+        || row >= target.y.saturating_add(target.height)
+    {
+        return (column, row);
+    }
+    (
+        source.x.saturating_add(column.saturating_sub(target.x)),
+        source.y.saturating_add(row.saturating_sub(target.y)),
+    )
 }
 
 fn place_overlay_beside_sidebar(cols: u16, rows: u16, sidebar_width: u16, source: Rect) -> Rect {
@@ -2224,6 +2331,37 @@ fn copy_frame_row(
             target.cells.get_mut(target_index),
         ) {
             *target = source.clone();
+        }
+    }
+}
+
+fn copy_frame_rect(
+    source: &FrameData,
+    target: &mut FrameData,
+    source_rect: Rect,
+    target_rect: Rect,
+) {
+    for y in 0..source_rect.height.min(target_rect.height) {
+        for x in 0..source_rect.width.min(target_rect.width) {
+            let source_x = source_rect.x.saturating_add(x);
+            let source_y = source_rect.y.saturating_add(y);
+            let target_x = target_rect.x.saturating_add(x);
+            let target_y = target_rect.y.saturating_add(y);
+            if source_x >= source.width
+                || source_y >= source.height
+                || target_x >= target.width
+                || target_y >= target.height
+            {
+                continue;
+            }
+            let source_index = source_y as usize * source.width as usize + source_x as usize;
+            let target_index = target_y as usize * target.width as usize + target_x as usize;
+            if let (Some(source), Some(target)) = (
+                source.cells.get(source_index),
+                target.cells.get_mut(target_index),
+            ) {
+                *target = source.clone();
+            }
         }
     }
 }
@@ -2409,5 +2547,45 @@ mod tests {
 
         let narrow_menu = place_overlay_beside_sidebar(40, 20, 28, Rect::new(3, 7, 18, 6));
         assert_eq!(narrow_menu, Rect::new(28, 7, 12, 6));
+    }
+
+    #[test]
+    fn server_overlay_is_copied_after_sidebar_composition() {
+        let base = labelled_frame(10, 8);
+        let mut server_frame = base.clone();
+        let source = Rect::new(2, 1, 4, 2);
+        for y in source.y..source.y + source.height {
+            for x in source.x..source.x + source.width {
+                let index = y as usize * server_frame.width as usize + x as usize;
+                server_frame.cells[index].symbol = "menu".to_owned();
+            }
+        }
+
+        let target = offset_rect(source, 0, 2, server_frame.width, server_frame.height);
+        assert_eq!(target, Rect::new(2, 3, 4, 2));
+
+        let mut composed = base.clone();
+        copy_frame_rect(&server_frame, &mut composed, source, target);
+        let copied = 3usize * composed.width as usize + 2;
+        assert_eq!(composed.cells[copied].symbol, "menu");
+        let original = composed.width as usize + 2;
+        assert_ne!(composed.cells[original].symbol, "menu");
+    }
+
+    #[test]
+    fn translated_overlay_mouse_maps_back_to_server_coordinates() {
+        let source = Rect::new(2, 1, 4, 2);
+        let target = Rect::new(2, 3, 4, 2);
+
+        assert_eq!(translate_overlay_point(source, target, 4, 4), (4, 2));
+        assert_eq!(translate_overlay_point(source, target, 8, 4), (8, 4));
+    }
+
+    #[test]
+    fn named_session_action_does_not_capture_footer_controls() {
+        assert!(new_session_label_hit(1));
+        assert!(new_session_label_hit(19));
+        assert!(!new_session_label_hit(20));
+        assert!(!new_session_label_hit(26));
     }
 }

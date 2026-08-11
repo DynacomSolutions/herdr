@@ -550,6 +550,18 @@ impl App {
                     workspace_cards,
                 }
             });
+        let overlay = match self.state.mode {
+            crate::app::Mode::ContextMenu => self.state.context_menu_rect(),
+            crate::app::Mode::GlobalMenu => Some(self.state.global_menu_rect()),
+            _ => None,
+        }
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+        .map(|rect| crate::protocol::SessionOverlaySummary {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        });
         crate::protocol::SessionSummary {
             workspaces: self
                 .state
@@ -567,6 +579,7 @@ impl App {
                 })
                 .collect(),
             sidebar,
+            overlay,
             overlay_active: self.state.mode != crate::app::Mode::Terminal,
         }
     }
