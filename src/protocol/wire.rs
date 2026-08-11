@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -658,12 +658,22 @@ pub struct SessionSidebarSummary {
     pub workspace_cards: Vec<SessionWorkspaceCardSummary>,
 }
 
+/// Geometry for a server-rendered context menu owned by a named session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextMenuSummary {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// Current workspace inventory for one named Herdr session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub workspaces: Vec<SessionWorkspaceSummary>,
     pub sidebar: Option<SessionSidebarSummary>,
     pub overlay_active: bool,
+    pub context_menu: Option<SessionContextMenuSummary>,
 }
 
 impl FrameData {

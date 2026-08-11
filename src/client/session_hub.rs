@@ -15,8 +15,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     ClientInputEvent, ClientKeybindings, ClientLaunchMode, ClientMessage, ClientMouseKind,
-    FrameData, RenderEncoding, ServerMessage, SessionSidebarSummary, SessionSummary,
-    MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE,
+    FrameData, RenderEncoding, ServerMessage, SessionContextMenuSummary, SessionSidebarSummary,
+    SessionSummary, MAX_FRAME_SIZE, MAX_RENDER_FRAME_SIZE,
 };
 
 use super::{ClientError, ClientLoopEvent};
@@ -102,7 +102,6 @@ enum SessionModal {
 
 struct SessionContextMenu {
     session: String,
-    x: u16,
     y: u16,
     highlighted: usize,
 }
@@ -123,6 +122,7 @@ struct HubState {
     remote_image_paste_key: Option<(crossterm::event::KeyCode, KeyModifiers)>,
     server_overlay_session: Option<String>,
     server_overlay_seen: bool,
+    server_overlay_base_frame: Option<FrameData>,
 }
 
 impl HubState {
@@ -262,6 +262,27 @@ impl HubState {
             .find(|session| session.name == name)
             .and_then(|session| session.sidebar_frame.as_ref())
     }
+
+    fn session_summary(&self, name: &str) -> Option<&SessionSummary> {
+        self.sessions
+            .iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.summary.as_ref())
+    }
+
+    fn displayed_server_context_menu(
+        &self,
+        session: &str,
+    ) -> Option<(SessionContextMenuSummary, Rect)> {
+        let source = self.session_summary(session)?.context_menu?;
+        let target = place_overlay_beside_sidebar(
+            self.cols,
+            self.rows,
+            self.sidebar_width(),
+            Rect::new(source.x, source.y, source.width, source.height),
+        );
+        Some((source, target))
+    }
 }
 
 pub(crate) fn run_remote_session_hub(
@@ -376,6 +397,7 @@ pub(crate) fn run_remote_session_hub(
         remote_image_paste_key,
         server_overlay_session: None,
         server_overlay_seen: false,
+        server_overlay_base_frame: None,
     };
     if let Some(session) = state.session_mut(initial_session) {
         session.running = true;
@@ -548,12 +570,14 @@ async fn run_hub_loop(
                         } else if overlay_is_owned && overlay_was_seen && !overlay_active {
                             state.server_overlay_session = None;
                             state.server_overlay_seen = false;
+                            state.server_overlay_base_frame = None;
                         } else if state.server_overlay_session.is_none()
                             && session == state.active.name
                             && overlay_active
                         {
                             state.server_overlay_session = Some(session);
                             state.server_overlay_seen = true;
+                            state.server_overlay_base_frame = state.active.frame.clone();
                         }
                     }
                 }
@@ -740,6 +764,7 @@ fn handle_local_input(
                     };
                     write_to_session(state, &session, &message)?;
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                        state.server_overlay_base_frame = state.session_frame(&session).cloned();
                         state.server_overlay_session = Some(session);
                         state.server_overlay_seen = false;
                     }
@@ -772,7 +797,6 @@ fn handle_local_input(
                 {
                     state.session_menu = Some(SessionContextMenu {
                         session,
-                        x: mouse.column,
                         y: mouse.row,
                         highlighted: 0,
                     });
@@ -843,11 +867,11 @@ fn session_menu_rect(state: &HubState) -> Option<Rect> {
     let menu = state.session_menu.as_ref()?;
     let width = 16.min(state.cols.max(1));
     let height = 4.min(state.rows.max(1));
-    Some(Rect::new(
-        menu.x.min(state.cols.saturating_sub(width)),
-        menu.y.min(state.rows.saturating_sub(height)),
-        width,
-        height,
+    Some(place_overlay_beside_sidebar(
+        state.cols,
+        state.rows,
+        state.sidebar_width(),
+        Rect::new(0, menu.y, width, height),
     ))
 }
 
@@ -926,14 +950,15 @@ fn forward_input_to_session(
         let Some(kind) = ClientMouseKind::from_crossterm(mouse.kind) else {
             return Ok(());
         };
+        let (column, row) = translate_server_overlay_mouse(state, session, mouse.column, mouse.row);
         return write_to_session(
             state,
             session,
             &ClientMessage::InputEvents {
                 events: vec![ClientInputEvent::Mouse {
                     kind,
-                    column: mouse.column,
-                    row: mouse.row,
+                    column,
+                    row,
                     modifiers: mouse.modifiers.bits(),
                 }],
             },
@@ -1506,12 +1531,25 @@ fn render_hub(
 }
 
 fn compose_frame(state: &HubState) -> FrameData {
-    if let Some(session) = state.server_overlay_session.as_deref() {
-        if let Some(frame) = state.session_frame(session) {
-            return frame.clone();
-        }
-    }
-    let Some(original) = state.active.frame.as_ref() else {
+    let server_context_menu = state
+        .server_overlay_session
+        .as_deref()
+        .and_then(|session| state.displayed_server_context_menu(session));
+    let original = match state.server_overlay_session.as_deref() {
+        Some(session) if !state.server_overlay_seen && session == state.active.name => state
+            .server_overlay_base_frame
+            .as_ref()
+            .or(state.active.frame.as_ref()),
+        Some(_) if !state.server_overlay_seen => state.active.frame.as_ref(),
+        Some(session) if server_context_menu.is_some() && session == state.active.name => state
+            .server_overlay_base_frame
+            .as_ref()
+            .or(state.active.frame.as_ref()),
+        Some(_) if server_context_menu.is_some() => state.active.frame.as_ref(),
+        Some(session) => state.session_frame(session),
+        None => state.active.frame.as_ref(),
+    };
+    let Some(original) = original else {
         return FrameData::from_ratatui_buffer_with_hyperlinks(
             &Buffer::empty(Rect::new(0, 0, state.cols, state.rows)),
             None,
@@ -1611,7 +1649,57 @@ fn compose_frame(state: &HubState) -> FrameData {
     if let Some(modal) = &state.modal {
         overlay_session_modal(&mut frame, modal);
     }
+    if let Some(session) = state.server_overlay_session.as_deref() {
+        if let Some((source, target)) = server_context_menu {
+            if let Some(source_frame) = state.session_frame(session) {
+                copy_frame_rect(
+                    source_frame,
+                    &mut frame,
+                    Rect::new(source.x, source.y, source.width, source.height),
+                    target,
+                );
+            }
+        }
+    }
     frame
+}
+
+fn place_overlay_beside_sidebar(cols: u16, rows: u16, sidebar_width: u16, source: Rect) -> Rect {
+    let x = sidebar_width.min(cols);
+    let width = source.width.min(cols.saturating_sub(x));
+    let height = source.height.min(rows.max(1));
+    Rect::new(x, source.y.min(rows.saturating_sub(height)), width, height)
+}
+
+fn translate_server_overlay_mouse(
+    state: &HubState,
+    session: &str,
+    column: u16,
+    row: u16,
+) -> (u16, u16) {
+    let Some((source, target)) = state.displayed_server_context_menu(session) else {
+        return (column, row);
+    };
+    translate_overlay_point(
+        Rect::new(source.x, source.y, source.width, source.height),
+        target,
+        column,
+        row,
+    )
+}
+
+fn translate_overlay_point(source: Rect, target: Rect, column: u16, row: u16) -> (u16, u16) {
+    if column < target.x
+        || column >= target.x.saturating_add(target.width)
+        || row < target.y
+        || row >= target.y.saturating_add(target.height)
+    {
+        return (column, row);
+    }
+    (
+        source.x.saturating_add(column.saturating_sub(target.x)),
+        source.y.saturating_add(row.saturating_sub(target.y)),
+    )
 }
 
 fn fill_frame_row(frame: &mut FrameData, y: u16, width: u16, template: &crate::protocol::CellData) {
@@ -1658,6 +1746,37 @@ fn copy_frame_row(
             target.cells.get_mut(target_index),
         ) {
             *target = source.clone();
+        }
+    }
+}
+
+fn copy_frame_rect(
+    source: &FrameData,
+    target: &mut FrameData,
+    source_rect: Rect,
+    target_rect: Rect,
+) {
+    for y in 0..source_rect.height.min(target_rect.height) {
+        for x in 0..source_rect.width.min(target_rect.width) {
+            let source_x = source_rect.x.saturating_add(x);
+            let source_y = source_rect.y.saturating_add(y);
+            let target_x = target_rect.x.saturating_add(x);
+            let target_y = target_rect.y.saturating_add(y);
+            if source_x >= source.width
+                || source_y >= source.height
+                || target_x >= target.width
+                || target_y >= target.height
+            {
+                continue;
+            }
+            let source_index = source_y as usize * source.width as usize + source_x as usize;
+            let target_index = target_y as usize * target.width as usize + target_x as usize;
+            if let (Some(source), Some(target)) = (
+                source.cells.get(source_index),
+                target.cells.get_mut(target_index),
+            ) {
+                *target = source.clone();
+            }
         }
     }
 }
@@ -1833,5 +1952,24 @@ mod tests {
                 assert_eq!(composed.cells[index], source.cells[index]);
             }
         }
+    }
+
+    #[test]
+    fn context_menus_are_placed_beside_session_names() {
+        let menu = place_overlay_beside_sidebar(100, 40, 28, Rect::new(3, 7, 18, 6));
+
+        assert_eq!(menu, Rect::new(28, 7, 18, 6));
+
+        let narrow_menu = place_overlay_beside_sidebar(40, 20, 28, Rect::new(3, 7, 18, 6));
+        assert_eq!(narrow_menu, Rect::new(28, 7, 12, 6));
+    }
+
+    #[test]
+    fn relocated_context_menu_clicks_use_server_coordinates() {
+        let source = Rect::new(3, 7, 18, 6);
+        let target = Rect::new(28, 7, 18, 6);
+
+        assert_eq!(translate_overlay_point(source, target, 30, 9), (5, 9));
+        assert_eq!(translate_overlay_point(source, target, 10, 9), (10, 9));
     }
 }
