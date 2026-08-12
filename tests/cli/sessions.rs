@@ -1,6 +1,43 @@
 use super::harness::*;
 
 #[test]
+fn named_session_names_may_contain_spaces() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let session_name = "Client Work";
+
+    let server = spawn_named_server(&config_home, &runtime_dir, session_name);
+    wait_for_socket(
+        &named_session_socket(&config_home, session_name),
+        Duration::from_secs(5),
+    );
+
+    let workspaces = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &["--session", session_name, "workspace", "list"],
+    );
+    assert!(workspaces["result"]["workspaces"].is_array());
+
+    let sessions = run_named_cli_json(&config_home, &runtime_dir, &["session", "list", "--json"]);
+    assert!(sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["name"] == session_name));
+
+    let stopped = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &["session", "stop", session_name, "--json"],
+    );
+    assert_eq!(stopped["stopped"], true);
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn named_sessions_use_separate_servers_and_workspace_state() {
     let base = unique_test_dir();
     let config_home = base.join("config");

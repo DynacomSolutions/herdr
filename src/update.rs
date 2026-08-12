@@ -952,7 +952,10 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
             attach_command: Some(if session.default {
                 "herdr".to_string()
             } else {
-                format!("herdr session attach {}", session.name)
+                format!(
+                    "herdr session attach {}",
+                    crate::session::command_name_arg(&session.name)
+                )
             }),
             label: session.name.clone(),
             client_socket_path: crate::session::client_socket_path_for(if session.default {

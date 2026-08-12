@@ -142,6 +142,16 @@ impl SessionHubBackend for LocalSessionHub {
 
     fn rename_session(&mut self, session: &str, new_name: &str) -> io::Result<()> {
         crate::session::rename_session(session, new_name).map_err(io::Error::other)?;
+        if session == crate::session::DEFAULT_SESSION_NAME {
+            if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
+                item.running = false;
+            }
+            self.sessions.push(RemoteSessionDescriptor {
+                name: new_name.to_owned(),
+                running: false,
+            });
+            return Ok(());
+        }
         if let Some(item) = self.sessions.iter_mut().find(|item| item.name == session) {
             item.name = new_name.to_owned();
             item.running = false;
@@ -501,16 +511,7 @@ fn create_hub_state(
             running: false,
         });
     }
-    descriptors.sort_by(
-        |left, right| match (left.name.as_str(), right.name.as_str()) {
-            (crate::session::DEFAULT_SESSION_NAME, crate::session::DEFAULT_SESSION_NAME) => {
-                std::cmp::Ordering::Equal
-            }
-            (crate::session::DEFAULT_SESSION_NAME, _) => std::cmp::Ordering::Less,
-            (_, crate::session::DEFAULT_SESSION_NAME) => std::cmp::Ordering::Greater,
-            _ => left.name.cmp(&right.name),
-        },
-    );
+    descriptors.sort_by(|left, right| compare_session_names(&left.name, &right.name));
 
     let mut next_generation = 1_u64;
     let active = connect_active(
@@ -563,6 +564,21 @@ fn create_hub_state(
         session.running = true;
     }
     Ok(state)
+}
+
+fn compare_session_names(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left, right) {
+        (crate::session::DEFAULT_SESSION_NAME, crate::session::DEFAULT_SESSION_NAME) => {
+            std::cmp::Ordering::Equal
+        }
+        (crate::session::DEFAULT_SESSION_NAME, _) => std::cmp::Ordering::Less,
+        (_, crate::session::DEFAULT_SESSION_NAME) => std::cmp::Ordering::Greater,
+        _ => left.cmp(right),
+    }
+}
+
+fn sort_hub_sessions(sessions: &mut [HubSession]) {
+    sessions.sort_by(|left, right| compare_session_names(&left.name, &right.name));
 }
 
 enum HubBridgeInput {
@@ -1366,8 +1382,7 @@ fn handle_local_input(
                     return Ok(false);
                 }
                 Some(HubRowTarget::Session(session))
-                    if session != crate::session::DEFAULT_SESSION_NAME
-                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) =>
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) =>
                 {
                     state.session_menu = Some(SessionContextMenu {
                         session,
@@ -1708,9 +1723,7 @@ fn create_named_session(
         sidebar_stream: None,
         sidebar_frame: None,
     });
-    state
-        .sessions
-        .sort_by(|left, right| left.name.cmp(&right.name));
+    sort_hub_sessions(&mut state.sessions);
     connect_summary(backend, state, &session, event_tx, should_quit.clone())
         .map_err(ClientError::ConnectionFailed)?;
     switch_active(backend, state, &session, event_tx, should_quit, None)
@@ -1742,9 +1755,27 @@ fn rename_named_session(
     }
     let was_active = state.active.name == session;
     let was_collapsed = state.collapsed.remove(session);
-    if let Some(item) = state.session_mut(session) {
+    if session == crate::session::DEFAULT_SESSION_NAME {
+        if let Some(item) = state.session_mut(session) {
+            item.running = false;
+            item.summary = None;
+            item.summary_generation = 0;
+            item.sidebar_generation = 0;
+            item.sidebar_frame = None;
+        }
+        state.sessions.push(HubSession {
+            name: new_name.clone(),
+            running: false,
+            summary: None,
+            summary_generation: 0,
+            summary_stream: None,
+            sidebar_generation: 0,
+            sidebar_stream: None,
+            sidebar_frame: None,
+        });
+    } else if let Some(item) = state.session_mut(session) {
         item.name = new_name.clone();
-        item.running = true;
+        item.running = false;
         item.summary = None;
         item.summary_generation = 0;
         item.sidebar_generation = 0;
@@ -1752,9 +1783,7 @@ fn rename_named_session(
     if was_collapsed {
         state.collapsed.insert(new_name.clone());
     }
-    state
-        .sessions
-        .sort_by(|left, right| left.name.cmp(&right.name));
+    sort_hub_sessions(&mut state.sessions);
     connect_summary(backend, state, &new_name, event_tx, should_quit.clone())
         .map_err(ClientError::ConnectionFailed)?;
     if was_active {
@@ -2590,5 +2619,12 @@ mod tests {
         assert!(new_session_label_hit(19));
         assert!(!new_session_label_hit(20));
         assert!(!new_session_label_hit(26));
+    }
+
+    #[test]
+    fn default_session_sorts_before_named_sessions() {
+        let mut names = ["Alpha Work", "default", "zeta"];
+        names.sort_by(|left, right| compare_session_names(left, right));
+        assert_eq!(names, ["default", "Alpha Work", "zeta"]);
     }
 }
