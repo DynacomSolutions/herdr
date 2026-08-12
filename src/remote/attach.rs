@@ -288,7 +288,7 @@ fn ensure_remote_named_sessions_ready(
         else {
             continue;
         };
-        if remote_server_restart_reason(
+        if remote_hub_server_restart_reason(
             version.as_deref(),
             protocol,
             detached_server_daemon,
@@ -1147,7 +1147,7 @@ fn ensure_remote_server_ready(
         return Ok(());
     };
 
-    let Some(reason) = remote_server_restart_reason(
+    let Some(reason) = remote_hub_server_restart_reason(
         version.as_deref(),
         protocol,
         detached_server_daemon,
@@ -1196,6 +1196,24 @@ fn remote_server_restart_reason(
         return Some(RemoteServerRestartReason::BinaryUpdated);
     }
     None
+}
+
+fn remote_hub_server_restart_reason(
+    version: Option<&str>,
+    protocol: Option<u32>,
+    detached_server_daemon: bool,
+    remote_binary_changed: bool,
+) -> Option<RemoteServerRestartReason> {
+    let reason = remote_server_restart_reason(
+        version,
+        protocol,
+        detached_server_daemon,
+        remote_binary_changed,
+    );
+    if reason == Some(RemoteServerRestartReason::VersionMismatch) && !remote_binary_changed {
+        return None;
+    }
+    reason
 }
 
 fn confirm_remote_install_with_running_server(
@@ -3388,6 +3406,32 @@ mod tests {
                 false
             ),
             None
+        );
+    }
+
+    #[test]
+    fn remote_hub_allows_older_same_protocol_server() {
+        assert_eq!(
+            remote_hub_server_restart_reason(
+                Some("0.8.0-dynacom.11"),
+                Some(CURRENT_PROTOCOL),
+                true,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_hub_still_requires_restart_when_binary_changed() {
+        assert_eq!(
+            remote_hub_server_restart_reason(
+                Some("0.8.0-dynacom.11"),
+                Some(CURRENT_PROTOCOL),
+                true,
+                true
+            ),
+            Some(RemoteServerRestartReason::VersionMismatch)
         );
     }
 
