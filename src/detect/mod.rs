@@ -287,15 +287,20 @@ pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> b
 }
 
 pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
-    matches!(
-        (source, agent_label),
-        ("herdr:pi", "pi")
-            | ("herdr:omp", "omp")
-            | ("herdr:mastracode", "mastracode")
-            | ("herdr:opencode", "opencode")
-            | ("herdr:kilo", "kilo")
-            | ("herdr:kimi", "kimi")
-    )
+    processless_full_lifecycle_hook_authority(source, agent_label)
+        || matches!(
+            (source, agent_label),
+            ("herdr:pi", "pi")
+                | ("herdr:omp", "omp")
+                | ("herdr:mastracode", "mastracode")
+                | ("herdr:opencode", "opencode")
+                | ("herdr:kilo", "kilo")
+                | ("herdr:kimi", "kimi")
+        )
+}
+
+pub(crate) fn processless_full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
+    matches!((source, agent_label), ("herdr:k8s-codex", "codex"))
 }
 
 pub(crate) fn session_identity_only_integration(source: &str, agent_label: &str) -> bool {
@@ -800,6 +805,19 @@ mod tests {
             "mastracode"
         ));
         assert!(!Agent::SCREEN_MANIFEST_AGENTS.contains(&Agent::Mastracode));
+    }
+
+    #[test]
+    fn k8s_codex_is_processless_hook_authority() {
+        assert!(processless_full_lifecycle_hook_authority(
+            "herdr:k8s-codex",
+            "codex"
+        ));
+        assert!(full_lifecycle_hook_authority("herdr:k8s-codex", "codex"));
+        assert!(!processless_full_lifecycle_hook_authority(
+            "herdr:codex",
+            "codex"
+        ));
     }
 
     #[test]
