@@ -273,7 +273,7 @@ fn ensure_remote_named_sessions_ready(
     remote_herdr: &RemoteHerdr,
     sessions: &[crate::client::RemoteSessionDescriptor],
     remote_binary_changed: bool,
-    live_handoff_enabled: bool,
+    _live_handoff_enabled: bool,
 ) -> io::Result<()> {
     for session in sessions
         .iter()
@@ -296,9 +296,7 @@ fn ensure_remote_named_sessions_ready(
         ) else {
             continue;
         };
-        if live_handoff
-            && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
-        {
+        if live_handoff {
             live_handoff_remote_session(ssh, remote_herdr, &session.name)?;
             continue;
         }
@@ -1140,7 +1138,7 @@ fn ensure_remote_server_ready(
     remote_herdr: &RemoteHerdr,
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
-    live_handoff_enabled: bool,
+    _live_handoff_enabled: bool,
 ) -> io::Result<()> {
     let status = remote_server_status(ssh, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -1162,9 +1160,7 @@ fn ensure_remote_server_ready(
         return Ok(());
     };
 
-    if live_handoff
-        && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
-    {
+    if live_handoff {
         match live_handoff_remote_server(ssh, remote_herdr) {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -1349,7 +1345,7 @@ fn remote_install_running_server_plan(
     detached_server_daemon: bool,
     remote_binary_changed: bool,
     live_handoff: bool,
-    live_handoff_enabled: bool,
+    _live_handoff_enabled: bool,
 ) -> RemoteInstallRunningServerPlan {
     let Some(reason) = remote_server_restart_reason(
         version,
@@ -1360,9 +1356,7 @@ fn remote_install_running_server_plan(
         return RemoteInstallRunningServerPlan::KeepRunning;
     };
 
-    if live_handoff
-        && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
-    {
+    if live_handoff {
         return RemoteInstallRunningServerPlan::LiveHandoff;
     }
 
@@ -3469,34 +3463,32 @@ mod tests {
     }
 
     #[test]
-    fn remote_install_plan_requires_stop_for_old_daemon() {
+    fn remote_install_plan_hands_off_old_daemon_when_supported() {
         assert_eq!(
             remote_install_running_server_plan(
                 Some(&current_version()),
                 Some(CURRENT_PROTOCOL),
                 false,
                 true,
-                false,
+                true,
                 false
             ),
-            RemoteInstallRunningServerPlan::StopRequired(
-                RemoteServerRestartReason::DaemonDetachMissing
-            )
+            RemoteInstallRunningServerPlan::LiveHandoff
         );
     }
 
     #[test]
-    fn remote_install_plan_requires_stop_after_helper_update() {
+    fn remote_install_plan_hands_off_after_helper_update_when_supported() {
         assert_eq!(
             remote_install_running_server_plan(
                 Some(&current_version()),
                 Some(CURRENT_PROTOCOL),
                 true,
                 true,
-                false,
+                true,
                 false
             ),
-            RemoteInstallRunningServerPlan::StopRequired(RemoteServerRestartReason::BinaryUpdated)
+            RemoteInstallRunningServerPlan::LiveHandoff
         );
     }
 
