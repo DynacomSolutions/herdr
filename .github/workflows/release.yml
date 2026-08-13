@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-dynacom.*"
 
 permissions:
   contents: read

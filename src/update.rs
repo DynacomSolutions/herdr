@@ -73,6 +73,7 @@ pub struct Version {
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split(['-', '+']).next()?;
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -951,7 +952,10 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
             attach_command: Some(if session.default {
                 "herdr".to_string()
             } else {
-                format!("herdr session attach {}", session.name)
+                format!(
+                    "herdr session attach {}",
+                    crate::session::command_name_arg(&session.name)
+                )
             }),
             label: session.name.clone(),
             client_socket_path: crate::session::client_socket_path_for(if session.default {
@@ -2374,6 +2378,18 @@ mod tests {
                 major: 0,
                 minor: 1,
                 patch: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_version_with_prerelease_suffix() {
+        assert_eq!(
+            Version::parse("0.8.0-dynacom.9"),
+            Some(Version {
+                major: 0,
+                minor: 8,
+                patch: 0,
             })
         );
     }

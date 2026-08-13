@@ -2905,7 +2905,12 @@ impl AppState {
                 seq,
                 ..
             } => {
-                if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
+                if crate::agent_resume::is_official_agent_source(&source, &agent_label)
+                    && !crate::detect::processless_full_lifecycle_hook_authority(
+                        &source,
+                        &agent_label,
+                    )
+                {
                     Vec::new()
                 } else {
                     self.update_terminal_state(pane_id, |terminal| {

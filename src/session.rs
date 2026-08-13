@@ -11,13 +11,20 @@ pub const SESSION_ENV_VAR: &str = "HERDR_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
 const MAX_SESSION_NAME_LEN: usize = 64;
+const DEFAULT_SESSION_STATE_FILES: &[&str] = &[
+    "session.json",
+    "session-history.json",
+    "herdr.log",
+    "herdr-client.log",
+    "herdr-server.log",
+];
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_WAIT_POLL: Duration = Duration::from_millis(25);
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
 
 static EXPLICIT_SESSION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub name: String,
     pub default: bool,
@@ -102,7 +109,7 @@ pub fn active_name() -> Option<String> {
 
 pub fn local_attach_command() -> String {
     match active_name() {
-        Some(name) => format!("herdr session attach {name}"),
+        Some(name) => format!("herdr session attach {}", command_name_arg(&name)),
         None => "herdr".to_string(),
     }
 }
@@ -113,8 +120,16 @@ pub fn local_stop_command() -> String {
 
 pub fn stop_command_for(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("herdr session stop {name}"),
+        Some(name) => format!("herdr session stop {}", command_name_arg(name)),
         None => "herdr server stop".to_string(),
+    }
+}
+
+pub(crate) fn command_name_arg(name: &str) -> String {
+    if name.contains(' ') {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
     }
 }
 
@@ -316,6 +331,63 @@ pub fn delete_session(name: &str) -> Result<SessionInfo, String> {
     }
 }
 
+pub fn rename_session(name: &str, new_name: &str) -> Result<SessionInfo, String> {
+    if new_name == DEFAULT_SESSION_NAME {
+        return Err("default is reserved for the default session".to_string());
+    }
+    validate_name(new_name)?;
+    if name == new_name {
+        return Err("new session name must be different".to_string());
+    }
+    if name == DEFAULT_SESSION_NAME {
+        return rename_default_session(new_name);
+    }
+    validate_name(name)?;
+    let source = data_dir_for(Some(name));
+    if !source.is_dir() {
+        return Err(format!("session {name} does not exist"));
+    }
+    let destination = data_dir_for(Some(new_name));
+    if destination.exists() {
+        return Err(format!("session {new_name} already exists"));
+    }
+    if is_running_at(&api_socket_path_for(Some(name))) {
+        stop_session(Some(name))?;
+    }
+    std::fs::rename(&source, &destination).map_err(|err| err.to_string())?;
+    Ok(session_info(Some(new_name)))
+}
+
+fn rename_default_session(new_name: &str) -> Result<SessionInfo, String> {
+    let source = data_dir_for(None);
+    let destination = data_dir_for(Some(new_name));
+    if destination.exists() {
+        return Err(format!("session {new_name} already exists"));
+    }
+    if is_running_at(&api_socket_path_for(None)) {
+        stop_session(None)?;
+    }
+
+    std::fs::create_dir_all(&destination).map_err(|err| err.to_string())?;
+    let mut moved = Vec::new();
+    for file_name in DEFAULT_SESSION_STATE_FILES {
+        let from = source.join(file_name);
+        if std::fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        let to = destination.join(file_name);
+        if let Err(err) = std::fs::rename(&from, &to) {
+            for moved_name in moved.iter().rev() {
+                let _ = std::fs::rename(destination.join(moved_name), source.join(moved_name));
+            }
+            let _ = std::fs::remove_dir(&destination);
+            return Err(err.to_string());
+        }
+        moved.push(*file_name);
+    }
+    Ok(session_info(Some(new_name)))
+}
+
 fn send_stop_request(
     mut stream: LocalStream,
     request: &serde_json::Value,
@@ -434,12 +506,16 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name == "." || name == ".." {
         return Err("session name cannot be . or ..".to_string());
     }
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return Err("session name cannot start or end with a space".to_string());
+    }
     if !name
         .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'.' | b'_' | b'-'))
     {
         return Err(
-            "session name may only contain ASCII letters, numbers, '.', '_' and '-'".to_string(),
+            "session name may only contain ASCII letters, numbers, spaces, '.', '_' and '-'"
+                .to_string(),
         );
     }
     Ok(())
@@ -850,6 +926,20 @@ mod tests {
     }
 
     #[test]
+    fn local_session_commands_quote_names_with_spaces() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(SESSION_ENV_VAR, "Client Work");
+
+        assert_eq!(
+            local_attach_command(),
+            "herdr session attach \"Client Work\""
+        );
+        assert_eq!(local_stop_command(), "herdr session stop \"Client Work\"");
+
+        std::env::remove_var(SESSION_ENV_VAR);
+    }
+
+    #[test]
     fn local_stop_command_uses_server_stop_for_default_session() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(SESSION_ENV_VAR);
@@ -1019,7 +1109,18 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         assert!(validate_name("../prod").is_err());
         assert!(validate_name("").is_err());
-        assert!(validate_name("work session").is_err());
+        assert!(validate_name(" work session").is_err());
+        assert!(validate_name("work session ").is_err());
+        assert!(validate_name("work\tsession").is_err());
+    }
+
+    #[test]
+    fn names_may_contain_interior_spaces() {
+        assert!(validate_name("client work").is_ok());
+        assert_eq!(
+            parse_target_name("client work").unwrap(),
+            Some("client work".to_string())
+        );
     }
 
     #[test]
@@ -1031,6 +1132,67 @@ mod tests {
     #[test]
     fn delete_default_session_is_rejected() {
         assert!(delete_session(DEFAULT_SESSION_NAME).is_err());
+    }
+
+    #[test]
+    fn rename_session_moves_persisted_state() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("herdr-session-rename-{}", std::process::id()));
+        let sessions_dir = config_home
+            .join(crate::config::app_dir_name())
+            .join("sessions");
+        let source = sessions_dir.join("old");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("state.json"), "state").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        let renamed = rename_session("old", "new").unwrap();
+
+        assert_eq!(renamed.name, "new");
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(sessions_dir.join("new/state.json")).unwrap(),
+            "state"
+        );
+        std::fs::remove_dir_all(&config_home).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn rename_default_session_moves_state_but_preserves_global_config() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home = std::env::temp_dir().join(format!(
+            "herdr-default-session-rename-{}",
+            std::process::id()
+        ));
+        let config_dir = config_home.join(crate::config::app_dir_name());
+        std::fs::create_dir_all(config_dir.join("sessions/existing")).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "global").unwrap();
+        std::fs::write(config_dir.join("session.json"), "state").unwrap();
+        std::fs::write(config_dir.join("session-history.json"), "history").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        let renamed = rename_session(DEFAULT_SESSION_NAME, "Client Work").unwrap();
+
+        assert_eq!(renamed.name, "Client Work");
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("sessions/Client Work/session.json")).unwrap(),
+            "state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("sessions/Client Work/session-history.json"))
+                .unwrap(),
+            "history"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("config.toml")).unwrap(),
+            "global"
+        );
+        assert!(config_dir.join("sessions/existing").is_dir());
+        assert!(!config_dir.join("session.json").exists());
+        std::fs::remove_dir_all(&config_home).unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

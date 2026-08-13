@@ -406,8 +406,21 @@ fn run_session_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => session_list(&args[1..]),
         "attach" => session_attach_help(&args[1..]),
+        #[cfg(unix)]
+        "hub-bridge" => {
+            if args.len() > 2 {
+                return Ok(2);
+            }
+            let initial_session = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(crate::session::DEFAULT_SESSION_NAME);
+            crate::client::run_local_session_hub_bridge(initial_session)?;
+            Ok(0)
+        }
         "stop" => session_stop(&args[1..]),
         "delete" => session_delete(&args[1..]),
+        "rename" => session_rename(&args[1..]),
         "help" | "--help" | "-h" => {
             print_session_help();
             Ok(0)
@@ -502,6 +515,31 @@ fn session_delete(args: &[String]) -> std::io::Result<i32> {
         }
         Err(message) => {
             print_session_error("session_delete_failed", &message);
+            Ok(1)
+        }
+    }
+}
+
+fn session_rename(args: &[String]) -> std::io::Result<i32> {
+    let (name, new_name, json) = match parse_session_rename_args(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+    match crate::session::rename_session(&name, &new_name) {
+        Ok(session) => {
+            if json {
+                _print_json(&serde_json::json!({
+                    "renamed": true,
+                    "previous_name": name,
+                    "session": session,
+                }));
+            } else {
+                println!("renamed session {name} to {}", session.name);
+            }
+            Ok(0)
+        }
+        Err(message) => {
+            print_session_error("session_rename_failed", &message);
             Ok(1)
         }
     }
@@ -964,6 +1002,24 @@ fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, 
     Ok((name, json))
 }
 
+fn parse_session_rename_args(args: &[String]) -> Result<(String, String, bool), i32> {
+    let usage = "usage: herdr session rename <name> <new-name> [--json]";
+    let mut names = Vec::new();
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            names.push(arg.clone());
+        }
+    }
+    if names.len() != 2 {
+        eprintln!("{usage}");
+        return Err(2);
+    }
+    Ok((names.remove(0), names.remove(0), json))
+}
+
 fn print_session_table(sessions: &[crate::session::SessionInfo]) {
     println!("{:<20} {:<8} {:<48} socket", "name", "status", "directory");
     for session in sessions {
@@ -1016,6 +1072,7 @@ fn print_session_help() {
     eprintln!("  herdr session attach <name>");
     eprintln!("  herdr session stop <name> [--json]");
     eprintln!("  herdr session delete <name> [--json]");
+    eprintln!("  herdr session rename <name> <new-name> [--json]");
     eprintln!("  use 'default' as <name> to target the default session for stop");
 }
 
@@ -1164,5 +1221,18 @@ mod tests {
                 "5000",
             ]
         );
+    }
+
+    #[test]
+    fn session_rename_args_accept_two_names_and_json() {
+        assert_eq!(
+            super::parse_session_rename_args(&[
+                "old".to_string(),
+                "new".to_string(),
+                "--json".to_string(),
+            ]),
+            Ok(("old".to_string(), "new".to_string(), true))
+        );
+        assert!(super::parse_session_rename_args(&["old".to_string()]).is_err());
     }
 }

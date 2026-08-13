@@ -94,10 +94,20 @@ HERDR_REMOTE_BINARY=target/release/herdr herdr --remote workbox
 
 ## Remote named sessions
 
-Use `--session` with `--remote` to attach to a named session on the remote host:
+Remote attach discovers named sessions from the SSH host and presents them as collapsible roots in the local sidebar. Each root contains that session's workspaces; the SSH target is transport only and is not shown as another tree level. Click a session to expand or collapse it, and click a workspace to switch the active remote view.
+
+Use **+ new named session** at the bottom of the sidebar to create and switch to a session without leaving the interface. Herdr keeps lightweight summary connections to running sessions and streams the full UI only for the selected session.
+
+Use `--session` with `--remote` to choose the initially active named session:
 
 ```bash
 herdr --remote workbox --session agents
+```
+
+When a release changes the client protocol, `--handoff` upgrades every compatible running named session while preserving its pane processes:
+
+```bash
+herdr --remote workbox --handoff
 ```
 
 ## Direct terminal attach

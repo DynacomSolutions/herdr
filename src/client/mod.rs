@@ -15,6 +15,11 @@
 #[cfg(unix)]
 mod direct_graphics;
 mod input;
+#[cfg(unix)]
+mod session_hub;
+
+#[cfg(unix)]
+pub(crate) use session_hub::{run_local_session_hub_bridge, RemoteSessionDescriptor};
 
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -812,6 +817,56 @@ fn do_handshake(
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
 ) -> Result<RenderEncoding, ClientError> {
+    let launch_mode = client_launch_mode(
+        direct_attach_requested,
+        exact_cell_size,
+        cell_width_px,
+        cell_height_px,
+    );
+    do_handshake_with_launch_mode(
+        stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        launch_mode,
+    )
+}
+
+fn do_handshake_with_launch_mode(
+    stream: &mut LocalStream,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+) -> Result<RenderEncoding, ClientError> {
+    do_handshake_with_options(
+        stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        requested_keybindings(),
+        launch_mode,
+        handshake_read_timeout(),
+    )
+}
+
+fn do_handshake_with_options(
+    stream: &mut LocalStream,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    keybindings: ClientKeybindings,
+    launch_mode: ClientLaunchMode,
+    read_timeout: Duration,
+) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
@@ -824,13 +879,8 @@ fn do_handshake(
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        keybindings: requested_keybindings(),
-        launch_mode: client_launch_mode(
-            direct_attach_requested,
-            exact_cell_size,
-            cell_width_px,
-            cell_height_px,
-        ),
+        keybindings,
+        launch_mode,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -838,7 +888,7 @@ fn do_handshake(
     // Read Welcome.
     set_handshake_recv_timeout(
         stream,
-        Some(handshake_read_timeout()),
+        Some(read_timeout),
         "client handshake read timeout unavailable",
     )?;
     let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
@@ -887,8 +937,21 @@ enum ClientLoopEvent {
     Resize(u16, u16, u32, u32),
     /// Server message received.
     ServerMessage(ServerMessage),
+    #[cfg(unix)]
+    HubServerMessage {
+        session: String,
+        generation: u64,
+        stream_kind: session_hub::HubStreamKind,
+        message: ServerMessage,
+    },
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
+    #[cfg(unix)]
+    HubServerDisconnected {
+        session: String,
+        generation: u64,
+        stream_kind: session_hub::HubStreamKind,
+    },
     /// Timer tick.
     Timer,
 }
@@ -1687,6 +1750,7 @@ async fn run_client_loop(
                     state.blit_encoder.commit(frame_data, encoded);
                     state.repaint_pending = false;
                 }
+                ServerMessage::SessionSummary(_) => {}
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
                         record_received_kitty_graphics(&frame.bytes);
@@ -1877,6 +1941,9 @@ async fn run_client_loop(
                     "server closed connection",
                 )));
             }
+            #[cfg(unix)]
+            ClientLoopEvent::HubServerMessage { .. }
+            | ClientLoopEvent::HubServerDisconnected { .. } => {}
             ClientLoopEvent::Timer => {
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
