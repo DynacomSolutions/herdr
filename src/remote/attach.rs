@@ -288,19 +288,25 @@ fn ensure_remote_named_sessions_ready(
         else {
             continue;
         };
-        if remote_hub_server_restart_reason(
+        let Some(reason) = remote_hub_server_restart_reason(
             version.as_deref(),
             protocol,
             detached_server_daemon,
             remote_binary_changed,
-        )
-        .is_none()
-        {
+        ) else {
             continue;
-        }
-        if live_handoff_enabled && live_handoff {
+        };
+        if live_handoff
+            && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
+        {
             live_handoff_remote_session(ssh, remote_herdr, &session.name)?;
             continue;
+        }
+        if reason == RemoteServerRestartReason::ProtocolMismatch {
+            return Err(io::Error::other(format!(
+                "named session {} uses an incompatible protocol and does not support a safe live handoff; its server and panes were left running",
+                session.name
+            )));
         }
         return Err(io::Error::other(format!(
             "named session {} is running an incompatible herdr server; rerun with --handoff to preserve its panes while upgrading it",
@@ -1156,14 +1162,24 @@ fn ensure_remote_server_ready(
         return Ok(());
     };
 
-    if live_handoff_enabled && live_handoff {
+    if live_handoff
+        && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
+    {
         match live_handoff_remote_server(ssh, remote_herdr) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                eprintln!("remote live handoff failed: {err}");
-                eprintln!("falling back to remote server restart.");
+                return Err(io::Error::other(format!(
+                    "remote live handoff failed: {err}; the existing server and its panes were left running"
+                )));
             }
         }
+    }
+
+    if reason == RemoteServerRestartReason::ProtocolMismatch {
+        return Err(io::Error::other(format!(
+            "remote herdr server on {} uses an incompatible protocol and does not support a safe live handoff; the server and its panes were left running",
+            ssh.target()
+        )));
     }
 
     if stop_after_install_approved {
@@ -1344,7 +1360,9 @@ fn remote_install_running_server_plan(
         return RemoteInstallRunningServerPlan::KeepRunning;
     };
 
-    if live_handoff_enabled && live_handoff {
+    if live_handoff
+        && (live_handoff_enabled || reason == RemoteServerRestartReason::ProtocolMismatch)
+    {
         return RemoteInstallRunningServerPlan::LiveHandoff;
     }
 
@@ -3509,6 +3527,21 @@ mod tests {
                 true,
                 true,
                 true
+            ),
+            RemoteInstallRunningServerPlan::LiveHandoff
+        );
+    }
+
+    #[test]
+    fn remote_install_plan_automatically_hands_off_protocol_mismatch() {
+        assert_eq!(
+            remote_install_running_server_plan(
+                Some("0.0.0"),
+                Some(CURRENT_PROTOCOL.saturating_sub(1)),
+                true,
+                true,
+                true,
+                false
             ),
             RemoteInstallRunningServerPlan::LiveHandoff
         );
