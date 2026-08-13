@@ -16,7 +16,7 @@ jobs:
   build:
     permissions:
       actions: read
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -135,3 +135,25 @@ jobs:
             release-inputs/herdr-macos-x86_64/herdr-macos-x86_64
             release-inputs/herdr-macos-aarch64/herdr-macos-aarch64
             release-inputs/SHA256SUMS
+
+      - name: Publish GitHub pre-release
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: release-inputs
+        run: |
+          assets=(
+            herdr-linux-x86_64/herdr-linux-x86_64
+            herdr-linux-aarch64/herdr-linux-aarch64
+            herdr-macos-x86_64/herdr-macos-x86_64
+            herdr-macos-aarch64/herdr-macos-aarch64
+            SHA256SUMS
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --prerelease \
+              --title "Herdr Spaces $GITHUB_REF_NAME" \
+              --notes "Automated Dynacom Herdr build for $GITHUB_REF_NAME."
+          fi
