@@ -672,7 +672,11 @@ impl TerminalState {
                 &agent_label,
                 &session_ref,
             );
-        if owner_conflicts && !foreground_takeover_allowed {
+        let processless_takeover_allowed = owner_conflicts
+            && session_ref.as_ref().is_some_and(|session_ref| {
+                self.processless_hook_confirms_session_owner(&source, &agent_label, session_ref)
+            });
+        if owner_conflicts && !foreground_takeover_allowed && !processless_takeover_allowed {
             return None;
         }
         let session_ref = session_ref.map(|session_ref| {
@@ -876,9 +880,13 @@ impl TerminalState {
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
-        let process_present = known_agent.is_some()
+        let local_process_present = known_agent.is_some()
             && self.detected_agent == known_agent
             && self.recent_agent_process_exit.is_none();
+        let processless_session_present = session_ref.as_ref().is_some_and(|session_ref| {
+            self.processless_hook_confirms_session_owner(source, agent_label, session_ref)
+        });
+        let process_present = local_process_present || processless_session_present;
         let anchored_session_ref = self
             .hook_authority
             .as_ref()
@@ -890,11 +898,12 @@ impl TerminalState {
                     .filter(|session| session.source == source && session.agent == agent_label)
                     .map(|session| &session.session_ref)
             });
-        let session_anchored = anchored_session_ref.is_some_and(|anchored| {
-            session_ref
-                .as_ref()
-                .is_none_or(|incoming| incoming == anchored)
-        });
+        let session_anchored = processless_session_present
+            || anchored_session_ref.is_some_and(|anchored| {
+                session_ref
+                    .as_ref()
+                    .is_none_or(|incoming| incoming == anchored)
+            });
         let opencode_cross_talk = (source, agent_label) == ("herdr:opencode", "opencode")
             && process_present
             && anchored_session_ref
@@ -1631,6 +1640,22 @@ impl TerminalState {
         })
     }
 
+    fn processless_hook_confirms_session_owner(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> bool {
+        crate::detect::processless_full_lifecycle_hook_authority(source, agent_label)
+            && self.current_session_identity_for_persistence().is_some_and(
+                |(_current_source, current_agent, current_kind, current_value)| {
+                    current_agent == agent_label
+                        && current_kind == session_ref.kind
+                        && current_value == session_ref.value
+                },
+            )
+    }
+
     fn foreground_agent_confirms_session_owner(
         &self,
         source: &str,
@@ -1784,7 +1809,14 @@ impl TerminalState {
     }
 
     fn hook_authority_is_effective(&self, authority: &HookAuthority) -> bool {
-        !crate::detect::full_lifecycle_hook_authority(&authority.source, &authority.agent_label)
+        (crate::detect::processless_full_lifecycle_hook_authority(
+            &authority.source,
+            &authority.agent_label,
+        ) && authority.session_ref.is_some())
+            || !crate::detect::full_lifecycle_hook_authority(
+                &authority.source,
+                &authority.agent_label,
+            )
             || crate::detect::parse_agent_label(&authority.agent_label).is_none_or(|agent| {
                 self.detected_agent == Some(agent) && self.recent_agent_process_exit.is_none()
             })
@@ -2433,6 +2465,60 @@ mod tests {
             );
             assert_eq!(terminal.state, AgentState::Working);
         }
+    }
+
+    #[test]
+    fn processless_lifecycle_hook_adopts_matching_persisted_session() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("codex-session").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: session_ref.clone(),
+        });
+
+        let mutation = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-codex".into(),
+            "codex".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref),
+            Some(10),
+        );
+
+        assert!(mutation.is_some());
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .map(|authority| authority.source.as_str()),
+            Some("herdr:k8s-codex")
+        );
+    }
+
+    #[test]
+    fn processless_lifecycle_hook_rejects_mismatched_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("current-session").unwrap(),
+        });
+
+        let mutation = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-codex".into(),
+            "codex".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::id("different-session"),
+            Some(10),
+        );
+
+        assert!(mutation.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
     }
 
     #[test]
