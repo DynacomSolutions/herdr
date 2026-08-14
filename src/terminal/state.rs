@@ -1833,6 +1833,11 @@ impl TerminalState {
                     .then(|| self.detected_agent.map(crate::detect::agent_label))
                     .flatten()
             })
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.agent.as_str())
+            })
     }
 
     pub fn effective_known_agent(&self) -> Option<Agent> {
@@ -5587,7 +5592,11 @@ mod tests {
             .expect("accepted release");
 
         assert!(mutation.session_ref_changed);
-        assert!(mutation.effective_state_change.is_none());
+        let change = mutation
+            .effective_state_change
+            .expect("visible restored agent should disappear on release");
+        assert_eq!(change.previous_agent_label.as_deref(), Some("hermes"));
+        assert_eq!(change.agent_label, None);
         assert!(terminal.persisted_agent_session.is_none());
     }
 
@@ -5823,6 +5832,9 @@ mod tests {
         let mutation = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);
         assert!(!mutation.session_ref_changed);
         assert!(terminal.persisted_agent_session.is_some());
+        assert_eq!(terminal.effective_agent_label(), Some("hermes"));
+        assert_eq!(terminal.effective_known_agent(), Some(Agent::Hermes));
+        assert!(terminal.is_agent_terminal());
     }
 
     #[test]
