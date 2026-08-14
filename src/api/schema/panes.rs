@@ -26,6 +26,10 @@ pub enum PaneRightClickTarget {
 pub struct PaneSplitParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Missing public pane ID whose external retained shell should be adopted.
+    /// This is accepted only by the retained workspace-shell integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recover_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
     pub direction: SplitDirection,

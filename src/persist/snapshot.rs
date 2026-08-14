@@ -121,6 +121,16 @@ pub struct PaneAgentSessionSnapshot {
 pub struct PaneHistorySnapshot {
     pub ansi: String,
     pub lines: usize,
+    /// Terminal input modes expected by a retained child process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_state: Option<crate::pane::InputState>,
+    /// Active kitty keyboard flags expected by a retained child process.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub keyboard_protocol_flags: u16,
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
 }
 
 /// Serializable BSP tree.
@@ -420,11 +430,19 @@ fn capture_pane_history(
     pane: Option<&crate::pane::PaneState>,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> Option<PaneHistorySnapshot> {
-    let ansi = terminal_runtimes
-        .get(&pane?.attached_terminal_id)?
-        .snapshot_history()?;
+    let runtime = terminal_runtimes.get(&pane?.attached_terminal_id)?;
+    let ansi = runtime.snapshot_history()?;
     let lines = ansi.lines().count();
-    Some(PaneHistorySnapshot { ansi, lines })
+    let keyboard_protocol_flags = match runtime.keyboard_protocol() {
+        crate::input::KeyboardProtocol::Legacy => 0,
+        crate::input::KeyboardProtocol::Kitty { flags } => flags,
+    };
+    Some(PaneHistorySnapshot {
+        ansi,
+        lines,
+        input_state: runtime.input_state(),
+        keyboard_protocol_flags,
+    })
 }
 
 pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {

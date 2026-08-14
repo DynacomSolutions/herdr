@@ -4485,6 +4485,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                recover_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
@@ -4543,6 +4544,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pane_split_recovery_is_rejected_outside_retained_workspace_shell() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-recovery-unavailable");
+        let target_pane = workspace.tabs[0].root_pane;
+        let recovery_pane_id = format!("{}:p2", workspace.id);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_recovery_unavailable".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(target_pane_id),
+                recover_pane_id: Some(recovery_pane_id),
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "pane_recovery_unavailable");
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pane_split_recovery_reuses_missing_public_pane_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = config_env_lock().lock().unwrap();
+        let original_shell = std::env::var_os("SHELL");
+        let root = unique_temp_path("api-pane-recovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let shell = root.join("workspace-shell.sh");
+        std::fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("SHELL", &shell);
+
+        let mut app = test_app();
+        app.state.default_shell = shell.to_string_lossy().into_owned();
+        let workspace = Workspace::test_new("api-pane-recovery");
+        let target_pane = workspace.tabs[0].root_pane;
+        let recovery_pane_id = format!("{}:p2", workspace.id);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_recovery".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(target_pane_id.clone()),
+                recover_pane_id: Some(recovery_pane_id.clone()),
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["pane"]["pane_id"], recovery_pane_id);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+
+        let duplicate = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_recovery_duplicate".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(target_pane_id),
+                recover_pane_id: response["result"]["pane"]["pane_id"]
+                    .as_str()
+                    .map(str::to_owned),
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        });
+        let duplicate: serde_json::Value = serde_json::from_str(&duplicate).unwrap();
+        assert_eq!(duplicate["error"]["code"], "pane_exists");
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn pane_split_request_focuses_new_pane_when_requested() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
@@ -4566,6 +4674,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                recover_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
@@ -4613,6 +4722,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                recover_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: Some(0.333),
                 cwd: None,
@@ -4668,6 +4778,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                recover_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,

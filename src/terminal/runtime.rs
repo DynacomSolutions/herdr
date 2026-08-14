@@ -127,6 +127,8 @@ impl TerminalRuntime {
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &crate::pane::PaneLaunchEnv,
         initial_history_ansi: Option<&str>,
+        initial_input_state: Option<crate::pane::InputState>,
+        initial_keyboard_protocol_flags: u16,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
@@ -142,6 +144,8 @@ impl TerminalRuntime {
             shell_config,
             launch_env,
             initial_history_ansi,
+            initial_input_state,
+            initial_keyboard_protocol_flags,
             events,
             render_notify,
             render_dirty,
@@ -250,8 +254,9 @@ impl TerminalRuntime {
         self.0.agent_detection_enabled_for_test()
     }
 
-    pub fn set_full_lifecycle_authority_active(&self, active: bool) {
-        self.0.set_full_lifecycle_authority_active(active);
+    pub fn set_full_lifecycle_authority_active(&self, active: bool, processless: bool) {
+        self.0
+            .set_full_lifecycle_authority_active(active, processless);
     }
 
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {

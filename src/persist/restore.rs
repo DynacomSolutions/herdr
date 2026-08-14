@@ -30,6 +30,8 @@ struct AgentRestoreState<'a> {
 struct PaneRestoreStartup<'a> {
     restore_plan: Option<crate::agent_resume::AgentResumePlan>,
     initial_history_ansi: Option<&'a str>,
+    initial_input_state: Option<crate::pane::InputState>,
+    initial_keyboard_protocol_flags: u16,
     duplicate_agent_session: bool,
     reserved_agent_session: Option<String>,
 }
@@ -572,6 +574,11 @@ fn restore_tab(
             continue;
         }
 
+        let restore_retained_input_state = runtime_context
+            .shell_config
+            .default_shell
+            .ends_with("workspace-shell.sh");
+
         let runtime_result = {
             #[cfg(unix)]
             if let Some(imported) = imported_runtime {
@@ -599,6 +606,14 @@ fn restore_tab(
                     runtime_context.shell_config,
                     &launch_env,
                     startup.initial_history_ansi,
+                    restore_retained_input_state
+                        .then_some(startup.initial_input_state)
+                        .flatten(),
+                    if restore_retained_input_state {
+                        startup.initial_keyboard_protocol_flags
+                    } else {
+                        0
+                    },
                     runtime_context.events.clone(),
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
@@ -618,6 +633,14 @@ fn restore_tab(
                     runtime_context.shell_config,
                     &launch_env,
                     startup.initial_history_ansi,
+                    restore_retained_input_state
+                        .then_some(startup.initial_input_state)
+                        .flatten(),
+                    if restore_retained_input_state {
+                        startup.initial_keyboard_protocol_flags
+                    } else {
+                        0
+                    },
                     runtime_context.events.clone(),
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
@@ -775,6 +798,16 @@ fn pane_restore_startup<'a>(
             None
         } else {
             history.map(|history| history.ansi.as_str())
+        },
+        initial_input_state: if has_native_agent_restore {
+            None
+        } else {
+            history.and_then(|history| history.input_state)
+        },
+        initial_keyboard_protocol_flags: if has_native_agent_restore {
+            0
+        } else {
+            history.map_or(0, |history| history.keyboard_protocol_flags)
         },
         duplicate_agent_session,
         reserved_agent_session,
@@ -935,6 +968,21 @@ mod tests {
         "/bin/sh"
     }
 
+    fn saved_input_state() -> crate::pane::InputState {
+        crate::pane::InputState {
+            alternate_screen: false,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+            mouse_alternate_scroll: false,
+            modify_other_keys: true,
+            modify_other_keys_mode: Some(crate::input::ModifyOtherKeysMode::Mode2),
+            color_scheme_reporting: false,
+        }
+    }
+
     #[test]
     fn capture_and_restore_node_round_trip() {
         let node = Node::Split {
@@ -1068,6 +1116,8 @@ mod tests {
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
+            input_state: Some(saved_input_state()),
+            keyboard_protocol_flags: 5,
         };
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
@@ -1079,6 +1129,8 @@ mod tests {
 
         assert!(startup.restore_plan.is_some());
         assert!(startup.initial_history_ansi.is_none());
+        assert!(startup.initial_input_state.is_none());
+        assert_eq!(startup.initial_keyboard_protocol_flags, 0);
         assert!(!startup.duplicate_agent_session);
     }
 
@@ -1093,6 +1145,8 @@ mod tests {
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
+            input_state: None,
+            keyboard_protocol_flags: 0,
         };
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
@@ -1121,6 +1175,8 @@ mod tests {
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
+            input_state: Some(saved_input_state()),
+            keyboard_protocol_flags: 5,
         };
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
@@ -1132,6 +1188,8 @@ mod tests {
 
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
+        assert_eq!(startup.initial_input_state, Some(saved_input_state()));
+        assert_eq!(startup.initial_keyboard_protocol_flags, 5);
         assert!(!startup.duplicate_agent_session);
         assert!(resumed.is_empty());
     }
@@ -1611,12 +1669,66 @@ mod tests {
             restored_text.contains("RESTORED_HISTORY 👨‍👩‍👧 LINK"),
             "styled Unicode and hyperlink text should survive history replay"
         );
+        assert_eq!(
+            runtime.keyboard_protocol(),
+            crate::input::KeyboardProtocol::Legacy,
+            "fresh shells must not inherit retained-child keyboard modes"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while runtime.cwd().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn retained_shell_restore_rehydrates_keyboard_input_modes() {
+        use std::os::unix::fs::symlink;
+
+        let (snapshot, history) = snapshot_with_saved_pane_history();
+        let unique = format!(
+            "herdr-workspace-shell-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let shell = directory.join("workspace-shell.sh");
+        symlink("/bin/sh", &shell).unwrap();
+
+        let (events, _events_rx) = mpsc::channel(8);
+        let (_workspaces, _terminals, runtimes) = restore(
+            &snapshot,
+            Some(&history),
+            5,
+            40,
+            4096,
+            shell.to_str().unwrap(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let runtime = runtimes
+            .values()
+            .next()
+            .expect("retained-shell runtime should exist");
+
+        assert_eq!(runtime.input_state(), Some(saved_input_state()));
+        assert_eq!(
+            runtime.keyboard_protocol(),
+            crate::input::KeyboardProtocol::Kitty { flags: 5 }
+        );
+
+        let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+        drop(runtimes);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -1685,6 +1797,8 @@ mod tests {
                             )
                             .to_string(),
                             lines: 1,
+                            input_state: Some(saved_input_state()),
+                            keyboard_protocol_flags: 5,
                         },
                     )]),
                 }],

@@ -3091,6 +3091,13 @@
                 "null"
               ]
             },
+            "recover_pane_id": {
+              "description": "Missing public pane ID whose external retained shell should be adopted.\nThis is accepted only by the retained workspace-shell integration.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "right_click": {
               "$ref": "#/schemas/request/$defs/PaneRightClickTarget",
               "default": "herdr"

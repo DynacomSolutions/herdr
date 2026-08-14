@@ -613,6 +613,7 @@ impl App {
             crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                recover_pane_id: None,
                 direction,
                 ratio: None,
                 cwd: None,
