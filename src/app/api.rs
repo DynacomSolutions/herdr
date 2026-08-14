@@ -458,6 +458,7 @@ impl App {
                     };
                     runtime.set_full_lifecycle_authority_active(
                         terminal.full_lifecycle_hook_authority_active(),
+                        terminal.processless_full_lifecycle_hook_authority_active(),
                     );
                 }
             }

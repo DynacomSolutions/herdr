@@ -1860,6 +1860,16 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
+    pub fn processless_full_lifecycle_hook_authority_active(&self) -> bool {
+        self.hook_authority.as_ref().is_some_and(|authority| {
+            self.hook_authority_is_effective(authority)
+                && crate::detect::processless_full_lifecycle_hook_authority(
+                    &authority.source,
+                    &authority.agent_label,
+                )
+        })
+    }
+
     fn visible_blocker_overrides_hook(&self) -> bool {
         if self.live_full_lifecycle_hook_authority() {
             return false;

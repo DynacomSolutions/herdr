@@ -1024,6 +1024,7 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    processless_full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
@@ -1964,6 +1965,7 @@ impl PaneRuntime {
         };
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let processless_full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
@@ -1984,6 +1986,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
+            processless_full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
@@ -2039,6 +2042,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let processless_full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
@@ -2501,6 +2505,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
+            processless_full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
@@ -2532,11 +2537,14 @@ impl PaneRuntime {
         self.detect_handle.is_some()
     }
 
-    pub fn set_full_lifecycle_authority_active(&self, active: bool) {
+    pub fn set_full_lifecycle_authority_active(&self, active: bool, processless: bool) {
         let previous = self
             .full_lifecycle_authority_active
             .swap(active, Ordering::AcqRel);
-        if active && !previous {
+        let previous_processless = self
+            .processless_full_lifecycle_authority_active
+            .swap(active && processless, Ordering::AcqRel);
+        if (active && !previous) || (!active && previous && previous_processless) {
             self.detect_reset_notify.notify_one();
         }
     }
@@ -3002,6 +3010,7 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+                processless_full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
@@ -3556,6 +3565,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            processless_full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
@@ -3587,6 +3597,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            processless_full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
@@ -4233,7 +4244,7 @@ mod tests {
         let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
 
-        runtime.set_full_lifecycle_authority_active(true);
+        runtime.set_full_lifecycle_authority_active(true, false);
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             reset_notify.notified(),
@@ -4241,7 +4252,7 @@ mod tests {
         .await
         .expect("false-to-true transition should notify detection reset");
 
-        runtime.set_full_lifecycle_authority_active(true);
+        runtime.set_full_lifecycle_authority_active(true, false);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -4252,7 +4263,7 @@ mod tests {
             "repeated true-to-true sync should not notify detection reset"
         );
 
-        runtime.set_full_lifecycle_authority_active(false);
+        runtime.set_full_lifecycle_authority_active(false, false);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -4263,13 +4274,35 @@ mod tests {
             "true-to-false transition should not notify detection reset"
         );
 
-        runtime.set_full_lifecycle_authority_active(true);
+        runtime.set_full_lifecycle_authority_active(true, false);
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             reset_notify.notified(),
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[tokio::test]
+    async fn processless_full_lifecycle_authority_release_notifies_detection_reset() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
+        let reset_notify = runtime.agent_detection_reset_notify_for_test();
+
+        runtime.set_full_lifecycle_authority_active(true, true);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reset_notify.notified(),
+        )
+        .await
+        .expect("activating processless authority should notify detection reset");
+
+        runtime.set_full_lifecycle_authority_active(false, false);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reset_notify.notified(),
+        )
+        .await
+        .expect("releasing processless authority should notify detection reset");
     }
 
     #[cfg(unix)]
