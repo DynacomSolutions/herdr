@@ -489,7 +489,7 @@ impl App {
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
     }
 
-    pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
+    pub(crate) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
         let (agg_state, seen) = ws.aggregate_state(&self.state.terminals);
         crate::api::schema::WorkspaceInfo {
@@ -513,6 +513,74 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+        }
+    }
+
+    pub(crate) fn session_summary(&self) -> crate::protocol::SessionSummary {
+        let sidebar = (self.state.view.layout == crate::app::state::ViewLayout::Desktop
+            && !self.state.sidebar_collapsed
+            && self.state.view.sidebar_rect.width > 0)
+            .then(|| {
+                let (spaces, _) = crate::ui::expanded_sidebar_sections(
+                    self.state.view.sidebar_rect,
+                    self.state.sidebar_section_split,
+                );
+                let workspace_cards = crate::ui::compute_workspace_card_areas(
+                    &self.state,
+                    self.state.view.sidebar_rect,
+                )
+                .iter()
+                .filter_map(|card| {
+                    self.state.workspaces.get(card.ws_idx).map(|workspace| {
+                        crate::protocol::SessionWorkspaceCardSummary {
+                            workspace_id: workspace.id.clone(),
+                            x: card.rect.x,
+                            y: card.rect.y,
+                            width: card.rect.width,
+                            height: card.rect.height,
+                        }
+                    })
+                })
+                .collect();
+                crate::protocol::SessionSidebarSummary {
+                    width: self.state.view.sidebar_rect.width,
+                    spaces_y: spaces.y,
+                    spaces_height: spaces.height,
+                    footer_y: self.state.sidebar_new_button_rect().y,
+                    workspace_cards,
+                }
+            });
+        let overlay = match self.state.mode {
+            crate::app::Mode::ContextMenu => self.state.context_menu_rect(),
+            crate::app::Mode::GlobalMenu => Some(self.state.global_menu_rect()),
+            _ => None,
+        }
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+        .map(|rect| crate::protocol::SessionOverlaySummary {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        });
+        crate::protocol::SessionSummary {
+            workspaces: self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let workspace = self.workspace_info(index);
+                    crate::protocol::SessionWorkspaceSummary {
+                        workspace_id: workspace.workspace_id,
+                        label: workspace.label,
+                        focused: workspace.focused,
+                        agent_status: workspace.agent_status,
+                    }
+                })
+                .collect(),
+            sidebar,
+            overlay,
+            overlay_active: self.state.mode != crate::app::Mode::Terminal,
         }
     }
 }

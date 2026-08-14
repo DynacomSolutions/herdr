@@ -2133,6 +2133,58 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn workspace_context_menu_opens_at_click_position() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let card = app.state.view.workspace_card_areas[0].rect;
+        let click_x = card.x + 1;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            click_x,
+            card.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("workspace menu");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::Workspace { ws_idx: 0 }
+                | ContextMenuKind::GitWorkspace { ws_idx: 0, .. }
+        ));
+        assert_eq!(menu.x, click_x);
+        assert_eq!(app.state.context_menu_rect().unwrap().x, click_x);
+        let menu_rect = app.state.context_menu_rect().unwrap();
+        let overlay = app.session_summary().overlay.expect("context menu overlay");
+        assert_eq!(
+            Rect::new(overlay.x, overlay.y, overlay.width, overlay.height),
+            menu_rect
+        );
+    }
+
+    #[test]
+    fn session_summary_recomputes_workspace_card_height_after_git_refresh() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("repo");
+        workspace.cached_git_branch = None;
+        workspace.cached_git_ahead_behind = None;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        assert_eq!(app.state.view.workspace_card_areas[0].rect.height, 1);
+
+        app.state.workspaces[0].cached_git_branch = Some("feature/session-details".into());
+
+        let sidebar = app.session_summary().sidebar.expect("desktop sidebar");
+        assert_eq!(sidebar.workspace_cards[0].height, 2);
+    }
+
     #[tokio::test]
     async fn pane_right_click_passthrough_falls_back_when_mouse_reporting_is_off() {
         let mut app = app_for_mouse_test();

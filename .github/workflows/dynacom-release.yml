@@ -1,0 +1,159 @@
+name: Dynacom release
+
+on:
+  push:
+    tags:
+      - "v*-dynacom.*"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  build:
+    permissions:
+      actions: read
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: "true"
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "$cargo_version" = "${GITHUB_REF_NAME#v}"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig on Linux
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install build tools on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+
+      - name: Configure Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Install Zig and build tools on macOS
+        if: runner.os == 'macOS'
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install zig@0.15 cmake ninja
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: dynacom-release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/herdr" "${{ matrix.name }}"
+          chmod +x "${{ matrix.name }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+      - name: Collect release assets
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 60); do
+            rm -rf release-inputs
+            if gh run download "$GITHUB_RUN_ID" --dir release-inputs 2>/dev/null \
+              && test -f release-inputs/herdr-linux-x86_64/herdr-linux-x86_64 \
+              && test -f release-inputs/herdr-linux-aarch64/herdr-linux-aarch64 \
+              && test -f release-inputs/herdr-macos-x86_64/herdr-macos-x86_64 \
+              && test -f release-inputs/herdr-macos-aarch64/herdr-macos-aarch64; then
+              exit 0
+            fi
+            echo "waiting for all platform artifacts ($attempt/60)"
+            sleep 10
+          done
+          exit 1
+
+      - name: Generate release checksums
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        working-directory: release-inputs
+        run: sha256sum herdr-*/herdr-* > SHA256SUMS
+
+      - name: Publish release bundle
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-${{ github.ref_name }}
+          retention-days: 90
+          compression-level: 0
+          path: |
+            release-inputs/herdr-linux-x86_64/herdr-linux-x86_64
+            release-inputs/herdr-linux-aarch64/herdr-linux-aarch64
+            release-inputs/herdr-macos-x86_64/herdr-macos-x86_64
+            release-inputs/herdr-macos-aarch64/herdr-macos-aarch64
+            release-inputs/SHA256SUMS
+
+      - name: Publish GitHub pre-release
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: release-inputs
+        run: |
+          assets=(
+            herdr-linux-x86_64/herdr-linux-x86_64
+            herdr-linux-aarch64/herdr-linux-aarch64
+            herdr-macos-x86_64/herdr-macos-x86_64
+            herdr-macos-aarch64/herdr-macos-aarch64
+            SHA256SUMS
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --prerelease \
+              --title "Herdr Spaces $GITHUB_REF_NAME" \
+              --notes "Automated Dynacom Herdr build for $GITHUB_REF_NAME."
+          fi
