@@ -580,6 +580,116 @@ fn server_stop_command_shuts_down_running_server() {
 }
 
 #[test]
+fn closed_workspace_stays_closed_after_restart_while_orphan_process_survives() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let kept = run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().expect("test path should be utf-8"),
+            "--label",
+            "kept-after-restart",
+        ],
+    );
+    let kept_workspace_id = kept["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace create should return an id")
+        .to_string();
+    let closed = run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().expect("test path should be utf-8"),
+            "--label",
+            "closed-before-restart",
+        ],
+    );
+    let closed_workspace_id = closed["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace create should return an id")
+        .to_string();
+    let closed_pane_id = closed["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("workspace create should return a pane id")
+        .to_string();
+
+    // Model an external Kubernetes PTY broker that outlives its Herdr panel.
+    // Process liveness must never be treated as authority to restore UI state.
+    let mut orphan = Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .env("HERDR_PANE_ID", &closed_pane_id)
+        .spawn()
+        .expect("orphan process should start");
+
+    let close = run_cli(&socket_path, &["pane", "close", &closed_pane_id]);
+    assert!(
+        close.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&close.stderr)
+    );
+    let before_restart = run_cli_json(&socket_path, &["workspace", "list"]);
+    let before = before_restart["result"]["workspaces"]
+        .as_array()
+        .expect("workspace.list should return workspaces");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["workspace_id"], kept_workspace_id);
+
+    let stopped = run_cli(&socket_path, &["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let pid = herdr.child.process_id();
+    let exit_status = herdr.child.wait().unwrap();
+    unregister_spawned_herdr_pid(pid);
+    assert!(exit_status.success(), "server stop should exit cleanly");
+    drop(herdr);
+    assert!(
+        orphan.try_wait().unwrap().is_none(),
+        "external orphan process should still be alive"
+    );
+
+    let restarted = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let after_restart = run_cli_json(&socket_path, &["workspace", "list"]);
+    let after = after_restart["result"]["workspaces"]
+        .as_array()
+        .expect("workspace.list should return workspaces");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["workspace_id"], kept_workspace_id);
+    assert!(
+        after
+            .iter()
+            .all(|workspace| workspace["workspace_id"] != closed_workspace_id),
+        "closed workspace must not return after restart"
+    );
+    assert!(
+        orphan.try_wait().unwrap().is_none(),
+        "orphan process liveness must not restore the closed workspace"
+    );
+
+    let _ = orphan.kill();
+    let _ = orphan.wait();
+    cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
 fn server_stop_then_restart_restores_pane_history() {
     let base = unique_test_dir();
     let config_home = base.join("config");
