@@ -122,8 +122,12 @@ pub struct InputState {
     pub mouse_protocol_mode: crate::input::MouseProtocolMode,
     pub mouse_protocol_encoding: crate::input::MouseProtocolEncoding,
     pub mouse_alternate_scroll: bool,
+    /// Mode 2 summary retained for older handoff payloads and callers that need report-all behavior.
     #[serde(default)]
     pub modify_other_keys: bool,
+    /// Exact mode used for encoding and handoff; absent legacy payloads fall back to mode 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys_mode: Option<crate::input::ModifyOtherKeysMode>,
     #[serde(default)]
     pub color_scheme_reporting: bool,
 }
@@ -1020,13 +1024,17 @@ impl GhosttyPaneTerminal {
         let mut key_encoder =
             crate::ghostty::KeyEncoder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
         key_encoder.set_from_terminal(&terminal);
+        let mut kitty_keyboard = KittyKeyboardTracker::default();
+        if let Ok(ansi) = terminal.keyboard_state_ansi() {
+            kitty_keyboard.observe(ansi.as_bytes());
+        }
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
-                kitty_keyboard: KittyKeyboardTracker::default(),
+                kitty_keyboard,
                 initial_default_foreground,
                 initial_default_background,
                 host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
@@ -1425,7 +1433,6 @@ impl GhosttyPaneTerminal {
         let Ok(mut core) = self.core.lock() else {
             return;
         };
-        #[cfg(windows)]
         core.kitty_keyboard.observe(ansi.as_bytes());
         core.terminal.write(ansi.as_bytes());
         #[cfg(windows)]
@@ -1510,8 +1517,14 @@ impl GhosttyPaneTerminal {
             }
         }
 
-        if input_state.modify_other_keys {
-            core.terminal.write(b"\x1b[>4;2m");
+        let modify_other_keys_mode = input_state.modify_other_keys_mode.or_else(|| {
+            input_state
+                .modify_other_keys
+                .then_some(crate::input::ModifyOtherKeysMode::Mode2)
+        });
+        if let Some(mode) = modify_other_keys_mode {
+            core.kitty_keyboard.observe(mode.set_sequence());
+            core.terminal.write(mode.set_sequence());
         }
 
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
@@ -1742,14 +1755,9 @@ impl GhosttyPaneTerminal {
             mouse_protocol_mode,
             mouse_protocol_encoding,
             mouse_alternate_scroll,
-            #[cfg(windows)]
-            modify_other_keys: core.kitty_keyboard.modify_other_keys_enabled(),
-            #[cfg(not(windows))]
-            modify_other_keys: core
-                .terminal
-                .keyboard_state_ansi()
-                .ok()
-                .is_some_and(|ansi| !ansi.is_empty()),
+            modify_other_keys: core.kitty_keyboard.modify_other_keys_mode()
+                == Some(crate::input::ModifyOtherKeysMode::Mode2),
+            modify_other_keys_mode: core.kitty_keyboard.modify_other_keys_mode(),
             color_scheme_reporting: core
                 .terminal
                 .mode_get(crate::ghostty::MODE_COLOR_SCHEME_REPORT)
@@ -3281,6 +3289,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: false,
             modify_other_keys: false,
+            modify_other_keys_mode: None,
             color_scheme_reporting: false,
         }
         .plain_page_keys_use_host_scrollback());
@@ -4409,7 +4418,8 @@ mod tests {
             mouse_protocol_mode: crate::input::MouseProtocolMode::ButtonMotion,
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
             mouse_alternate_scroll: true,
-            modify_other_keys: true,
+            modify_other_keys: false,
+            modify_other_keys_mode: Some(crate::input::ModifyOtherKeysMode::Mode1),
             color_scheme_reporting: true,
         });
 
@@ -4423,9 +4433,32 @@ mod tests {
                 mouse_protocol_mode: crate::input::MouseProtocolMode::ButtonMotion,
                 mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
                 mouse_alternate_scroll: true,
-                modify_other_keys: true,
+                modify_other_keys: false,
+                modify_other_keys_mode: Some(crate::input::ModifyOtherKeysMode::Mode1),
                 color_scheme_reporting: true,
             })
+        );
+
+        let (legacy_tx, _legacy_rx) = mpsc::channel(4);
+        let legacy_terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let legacy = GhosttyPaneTerminal::new(legacy_terminal, legacy_tx).unwrap();
+        legacy.seed_handoff_input_state(InputState {
+            alternate_screen: false,
+            application_cursor: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+            mouse_alternate_scroll: false,
+            modify_other_keys: true,
+            modify_other_keys_mode: None,
+            color_scheme_reporting: false,
+        });
+        assert_eq!(
+            legacy
+                .input_state()
+                .and_then(|state| state.modify_other_keys_mode),
+            Some(crate::input::ModifyOtherKeysMode::Mode2)
         );
 
         let encoded = pane.encode_terminal_key(

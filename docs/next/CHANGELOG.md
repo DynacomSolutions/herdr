@@ -23,6 +23,8 @@
 - Server stop requests now bypass pane and API traffic, preventing busy sessions from blocking shutdown or admitting a client while shutdown is pending. (#2612)
 - Fish `Ctrl+Alt` keybindings now work in panes after legacy Alt-prefixed control bytes are decoded with both modifiers. (#2514)
 - `herdr config check` now reports unknown built-in theme names instead of silently accepting them. (#2452)
+- Restored retained terminals now preserve exact Kitty keyboard and modifyOtherKeys modes, so Shift+Enter remains distinct from Enter after remote reattachment or a control-plane restart.
+- Processless Kubernetes Codex sessions now retain lifecycle authority across restoration and reconcile stale Working state after that authority is released.
 - macOS `herdr --remote` clients now keep the accepted bridge socket blocking, preventing an immediate disconnect after the protocol handshake. (#2478, thanks @mathijshenquet)
 - Prefix keybindings now preserve Shift in WezTerm Kitty keyboard mode, so commands such as config reload no longer trigger their unshifted action. (#2435)
 - BEL characters emitted by pane programs now reach the outer terminal so its audible and visual bell settings can react. (#2453)

@@ -4954,6 +4954,45 @@ mod tests {
     }
 
     #[test]
+    fn visiting_completed_background_pane_clears_unread_without_stale_working() {
+        let mut state = app_with_workspaces(&["active", "completed"]);
+        state.active = Some(0);
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[1]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            state.terminals.get(&terminal_id).unwrap().state,
+            AgentState::Idle
+        );
+        assert!(!state.workspaces[1].panes.get(&pane_id).unwrap().seen);
+
+        state.switch_workspace(1);
+
+        assert_eq!(
+            state.terminals.get(&terminal_id).unwrap().state,
+            AgentState::Idle,
+            "visiting a completed pane must not revive stale Working state"
+        );
+        assert!(state.workspaces[1].panes.get(&pane_id).unwrap().seen);
+    }
+
+    #[test]
     fn initial_idle_in_background_stays_seen() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);

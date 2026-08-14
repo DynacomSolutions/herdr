@@ -159,6 +159,9 @@ struct PendingAgentRelease {
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
+    #[cfg_attr(windows, allow(dead_code))]
+    input_state: Option<InputState>,
+    keyboard_protocol_flags: u16,
     windows_powershell_prompt_cwd_reporting: bool,
 }
 
@@ -1705,6 +1708,8 @@ impl PaneRuntime {
             shell_config,
             launch_env,
             None,
+            None,
+            0,
             events,
             render_notify,
             render_dirty,
@@ -1724,6 +1729,8 @@ impl PaneRuntime {
         shell_config: PaneShellConfig<'_>,
         launch_env: &PaneLaunchEnv,
         initial_history_ansi: Option<&str>,
+        initial_input_state: Option<InputState>,
+        initial_keyboard_protocol_flags: u16,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
@@ -1749,6 +1756,8 @@ impl PaneRuntime {
             SpawnInitialState {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
+                input_state: initial_input_state,
+                keyboard_protocol_flags: initial_keyboard_protocol_flags,
                 windows_powershell_prompt_cwd_reporting,
             },
             AgentDetection::Enabled,
@@ -2027,11 +2036,17 @@ impl PaneRuntime {
         pane_terminal.set_windows_powershell_prompt_cwd_reporting(
             initial_state.windows_powershell_prompt_cwd_reporting,
         );
+        #[cfg(unix)]
+        if let Some(input_state) = initial_state.input_state {
+            pane_terminal.seed_handoff_input_state(input_state);
+        }
+        #[cfg(unix)]
+        pane_terminal.seed_keyboard_protocol_flags(initial_state.keyboard_protocol_flags);
         if let Some(ansi) = initial_state.history_ansi {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
-        let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
+        let kitty_keyboard_flags = Arc::new(AtomicU16::new(initial_state.keyboard_protocol_flags));
 
         let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
@@ -3515,6 +3530,7 @@ mod tests {
                 mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
                 mouse_alternate_scroll: true,
                 modify_other_keys: true,
+                modify_other_keys_mode: Some(crate::input::ModifyOtherKeysMode::Mode2),
                 color_scheme_reporting: true,
             })
         );

@@ -220,6 +220,8 @@ mod tests {
                         PaneHistorySnapshot {
                             ansi: secret.to_string(),
                             lines: 1,
+                            input_state: None,
+                            keyboard_protocol_flags: 0,
                         },
                     )]),
                 }],

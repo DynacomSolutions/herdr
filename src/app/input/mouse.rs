@@ -3629,6 +3629,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            modify_other_keys_mode: None,
             color_scheme_reporting: false,
         };
 
@@ -4306,6 +4307,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            modify_other_keys_mode: None,
             color_scheme_reporting: false,
         };
 
@@ -4323,6 +4325,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: true,
             modify_other_keys: false,
+            modify_other_keys_mode: None,
             color_scheme_reporting: false,
         };
 

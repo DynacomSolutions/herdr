@@ -738,6 +738,7 @@ fn parse_pane_split_args(
     Ok(PaneSplitParams {
         workspace_id: None,
         target_pane_id: pane_id,
+        recover_pane_id: None,
         direction,
         ratio,
         cwd,

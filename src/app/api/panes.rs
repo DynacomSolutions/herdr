@@ -46,7 +46,7 @@ impl App {
         let Some((ws_idx, target_pane_id)) = target else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
-        let extra_env = match super::env::normalize_launch_env(params.env) {
+        let mut extra_env = match super::env::normalize_launch_env(params.env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
@@ -59,6 +59,35 @@ impl App {
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
         let host_terminal_appearance = self.state.host_terminal_appearance;
+        let recovery_number = if let Some(recover_pane_id) = params.recover_pane_id.as_deref() {
+            if !default_shell.ends_with("workspace-shell.sh") {
+                return encode_error(
+                    id,
+                    "pane_recovery_unavailable",
+                    "retained pane recovery requires workspace-shell.sh",
+                );
+            }
+            let workspace = &self.state.workspaces[ws_idx];
+            let prefix = format!("{}:p", workspace.id);
+            let Some(number) = recover_pane_id
+                .strip_prefix(&prefix)
+                .and_then(crate::workspace::decode_public_number)
+                .filter(|number| *number > 0)
+            else {
+                return encode_error(id, "invalid_recovery_pane", "invalid recovery pane id");
+            };
+            if workspace
+                .public_pane_numbers
+                .values()
+                .any(|existing| *existing == number)
+            {
+                return encode_error(id, "pane_exists", "recovery pane id is already in use");
+            }
+            extra_env.push(("HERDR_RECOVER_RETAINED_PANE".into(), "1".into()));
+            Some(number)
+        } else {
+            None
+        };
         let previous_focus = self.state.current_pane_focus_target();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "pane_not_found", "pane not found");
@@ -68,34 +97,52 @@ impl App {
             crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
         };
         let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
-        let split_result = match params.ratio {
-            Some(ratio) => ws.split_pane_with_ratio(
+        let split_result = if let Some(pane_number) = recovery_number {
+            ws.split_pane_recovering_public_number(
                 target_pane_id,
                 direction,
-                ratio,
+                params.ratio,
                 rows,
                 cols,
                 split_cwd,
+                pane_number,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
                 shell_config,
                 extra_env,
                 params.focus,
-            ),
-            None => ws.split_pane(
-                target_pane_id,
-                direction,
-                rows,
-                cols,
-                split_cwd,
-                scrollback_limit_bytes,
-                host_terminal_theme,
-                host_terminal_appearance,
-                shell_config,
-                extra_env,
-                params.focus,
-            ),
+            )
+        } else {
+            match params.ratio {
+                Some(ratio) => ws.split_pane_with_ratio(
+                    target_pane_id,
+                    direction,
+                    ratio,
+                    rows,
+                    cols,
+                    split_cwd,
+                    scrollback_limit_bytes,
+                    host_terminal_theme,
+                    host_terminal_appearance,
+                    shell_config,
+                    extra_env,
+                    params.focus,
+                ),
+                None => ws.split_pane(
+                    target_pane_id,
+                    direction,
+                    rows,
+                    cols,
+                    split_cwd,
+                    scrollback_limit_bytes,
+                    host_terminal_theme,
+                    host_terminal_appearance,
+                    shell_config,
+                    extra_env,
+                    params.focus,
+                ),
+            }
         };
         let (target_tab_idx, new_pane) = match split_result {
             Some(Ok(result)) => result,

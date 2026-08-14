@@ -768,6 +768,7 @@ impl Workspace {
             extra_env,
             focus_new_pane,
             None,
+            None,
         )
     }
 
@@ -801,6 +802,7 @@ impl Workspace {
             extra_env,
             focus_new_pane,
             None,
+            None,
         )
     }
 
@@ -832,6 +834,7 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
+            None,
             Some(argv),
         )
     }
@@ -865,7 +868,45 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
+            None,
             Some(argv),
+        )
+    }
+
+    /// Split a pane while reusing a missing public pane number so an external
+    /// retained-shell integration can reattach the exact surviving broker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_pane_recovering_public_number(
+        &mut self,
+        pane_id: PaneId,
+        direction: Direction,
+        ratio: Option<f32>,
+        rows: u16,
+        cols: u16,
+        cwd: Option<PathBuf>,
+        pane_number: usize,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        extra_env: Vec<(String, String)>,
+        focus_new_pane: bool,
+    ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
+        self.split_pane_with_runtime(
+            pane_id,
+            direction,
+            ratio,
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            extra_env,
+            focus_new_pane,
+            Some(pane_number),
+            None,
         )
     }
 
@@ -884,10 +925,21 @@ impl Workspace {
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
+        pane_number_override: Option<usize>,
         argv: Option<&[String]>,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
-        let pane_number = self.next_public_pane_number;
+        let pane_number = pane_number_override.unwrap_or(self.next_public_pane_number);
+        if self
+            .public_pane_numbers
+            .values()
+            .any(|existing| *existing == pane_number)
+        {
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "public pane id is already in use",
+            )));
+        }
         let tab_number = self.tabs[tab_idx].number;
         let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
         let tab = &mut self.tabs[tab_idx];
