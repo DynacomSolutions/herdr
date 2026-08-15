@@ -875,8 +875,19 @@ impl TerminalState {
                 reanchor_sequence: false,
             };
         }
-        if self.full_lifecycle_hook_report_matches_stale_session(source, agent_label, session_ref) {
+        let processless_persisted_session_present =
+            session_ref.as_ref().is_some_and(|session_ref| {
+                self.processless_persisted_session_confirms_owner(source, agent_label, session_ref)
+            });
+        if self.full_lifecycle_hook_report_matches_stale_session(source, agent_label, session_ref)
+            && !processless_persisted_session_present
+        {
             return FullLifecycleHookReportRoute::Ignore;
+        }
+        if processless_persisted_session_present {
+            if let Some(session_ref) = session_ref.as_ref() {
+                self.forget_stale_full_lifecycle_hook_session(source, agent_label, session_ref);
+            }
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
@@ -1646,14 +1657,30 @@ impl TerminalState {
         agent_label: &str,
         session_ref: &crate::agent_resume::AgentSessionRef,
     ) -> bool {
+        self.processless_persisted_session_confirms_owner(source, agent_label, session_ref)
+            || (crate::detect::processless_full_lifecycle_hook_authority(source, agent_label)
+                && self.current_session_identity_for_persistence().is_some_and(
+                    |(_current_source, current_agent, current_kind, current_value)| {
+                        current_agent == agent_label
+                            && current_kind == session_ref.kind
+                            && current_value == session_ref.value
+                    },
+                ))
+    }
+
+    fn processless_persisted_session_confirms_owner(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> bool {
         crate::detect::processless_full_lifecycle_hook_authority(source, agent_label)
-            && self.current_session_identity_for_persistence().is_some_and(
-                |(_current_source, current_agent, current_kind, current_value)| {
-                    current_agent == agent_label
-                        && current_kind == session_ref.kind
-                        && current_value == session_ref.value
-                },
-            )
+            && self
+                .persisted_agent_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.agent == agent_label && session.session_ref == *session_ref
+                })
     }
 
     fn foreground_agent_confirms_session_owner(
@@ -2511,6 +2538,47 @@ mod tests {
                 .map(|authority| authority.source.as_str()),
             Some("herdr:k8s-codex")
         );
+    }
+
+    #[test]
+    fn processless_lifecycle_hook_re_adopts_matching_persisted_session_after_stale_release() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("codex-session").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: session_ref.clone(),
+        });
+        terminal.remember_stale_full_lifecycle_hook_session(
+            "herdr:k8s-codex".into(),
+            "codex".into(),
+            session_ref.clone(),
+        );
+
+        let mutation = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-codex".into(),
+            "codex".into(),
+            AgentState::Idle,
+            None,
+            Some(session_ref.clone()),
+            Some(11),
+        );
+
+        assert!(mutation.is_some());
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.as_ref()),
+            Some(&session_ref)
+        );
+        assert!(!terminal.full_lifecycle_hook_report_matches_stale_session(
+            "herdr:k8s-codex",
+            "codex",
+            &Some(session_ref),
+        ));
     }
 
     #[test]
