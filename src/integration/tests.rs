@@ -2794,7 +2794,9 @@ fn bundled_integration_assets_report_session_refs() {
     );
     assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
     assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
-    assert!(KIMI_HOOK_ASSET.contains("source\": \"herdr:kimi"));
+    assert!(KIMI_HOOK_ASSET.contains("herdr:kimi"));
+    assert!(KIMI_HOOK_ASSET.contains("herdr:k8s-kimi"));
+    assert!(KIMI_HOOK_ASSET.contains("action == \"session\""));
     assert!(KIMI_HOOK_ASSET.contains("agent_session_id"));
     assert!(KIMI_HOOK_ASSET.contains("method = \"pane.report_agent_session\""));
     assert!(KIMI_HOOK_ASSET.contains("params[\"session_start_source\"] = \"startup\""));
@@ -2858,6 +2860,87 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(GROK_HOOK_ASSET.contains("herdr:grok"));
     assert!(!GROK_HOOK_ASSET.contains("\"state\":"));
     assert!(!GROK_HOOK_ASSET.contains("pane.release_agent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn kimi_hook_separates_identity_and_k8s_lifecycle_sources_inside_herdr() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+
+    fn emit(hook: &Path, base: &Path, action: &str) -> Value {
+        let socket_path = base.join(format!("{action}.sock"));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let mut child = Command::new(hook)
+            .arg(action)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", &socket_path)
+            .env("HERDR_PANE_ID", "w7:p1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"kimi-session"}"#)
+            .unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        stream.write_all(b"{}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "Kimi hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(&request).unwrap()
+    }
+
+    let base = unique_base();
+    fs::create_dir_all(&base).unwrap();
+    let hook = base.join("herdr-agent-state.sh");
+    fs::write(&hook, KIMI_HOOK_ASSET).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let session = emit(&hook, &base, "session");
+    assert_eq!(session["method"], "pane.report_agent_session");
+    assert_eq!(session["params"]["source"], "herdr:kimi");
+    assert_eq!(session["params"]["agent_session_id"], "kimi-session");
+    assert_eq!(session["params"]["session_start_source"], "startup");
+
+    let working = emit(&hook, &base, "working");
+    assert_eq!(working["method"], "pane.report_agent");
+    assert_eq!(working["params"]["source"], "herdr:k8s-kimi");
+    assert_eq!(working["params"]["agent"], "kimi");
+    assert_eq!(working["params"]["state"], "working");
+    assert_eq!(working["params"]["agent_session_id"], "kimi-session");
+
+    let disabled_socket = base.join("disabled.sock");
+    let listener = UnixListener::bind(&disabled_socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let output = Command::new(&hook)
+        .arg("working")
+        .env_remove("HERDR_ENV")
+        .env("HERDR_SOCKET_PATH", &disabled_socket)
+        .env("HERDR_PANE_ID", "w7:p1")
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+
+    let _ = fs::remove_dir_all(base);
 }
 
 #[test]
