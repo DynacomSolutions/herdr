@@ -1,7 +1,7 @@
 #!/bin/sh
 # managed by herdr; reinstalling the integration replaces this file.
 # HERDR_INTEGRATION_ID=kimi
-# HERDR_INTEGRATION_VERSION=6
+# HERDR_INTEGRATION_VERSION=7
 
 action="${1:-}"
 case "$action" in
@@ -32,9 +32,10 @@ if not isinstance(session_id, str) or not session_id:
     session_id = None
 
 seq = time.time_ns()
+source = "herdr:kimi" if action == "session" else "herdr:k8s-kimi"
 params = {
     "pane_id": os.environ["HERDR_PANE_ID"],
-    "source": "herdr:kimi",
+    "source": source,
     "agent": "kimi",
     "seq": seq,
 }
@@ -49,7 +50,7 @@ else:
 if session_id is not None:
     params["agent_session_id"] = session_id
 
-request = json.dumps({"id": f"herdr:kimi:{seq}", "method": method, "params": params})
+request = json.dumps({"id": f"{source}:{seq}", "method": method, "params": params})
 try:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(0.5)

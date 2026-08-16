@@ -888,6 +888,16 @@ impl TerminalState {
             if let Some(session_ref) = session_ref.as_ref() {
                 self.forget_stale_full_lifecycle_hook_session(source, agent_label, session_ref);
             }
+            if self
+                .suppressed_full_lifecycle_hook_reports
+                .get(source)
+                .is_some_and(|suppressed| {
+                    suppressed.agent_label == agent_label
+                        && suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit
+                })
+            {
+                self.suppressed_full_lifecycle_hook_reports.remove(source);
+            }
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
@@ -2472,41 +2482,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_session_claim_activates_full_lifecycle_integrations() {
-        for (agent, source, label) in [
-            (Agent::Kimi, "herdr:kimi", "kimi"),
-            (Agent::Kilo, "herdr:kilo", "kilo"),
-        ] {
-            let mut terminal = test_terminal();
-            terminal.set_detected_state(Some(agent), AgentState::Idle);
-            let session_ref = crate::agent_resume::AgentSessionRef::id(format!("{label}-root"));
+    fn startup_session_claim_activates_full_lifecycle_integration() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Kilo), AgentState::Idle);
+        let session_ref = crate::agent_resume::AgentSessionRef::id("kilo-root");
 
-            let session = terminal.set_agent_session_ref_for_session_start(
-                source.into(),
-                label.into(),
-                session_ref.clone(),
-                Some(10),
-                Some("startup".into()),
-            );
-            let working = terminal.set_hook_authority_with_session_ref(
-                source.into(),
-                label.into(),
-                AgentState::Working,
-                None,
-                session_ref,
-                Some(11),
-            );
+        let session = terminal.set_agent_session_ref_for_session_start(
+            "herdr:kilo".into(),
+            "kilo".into(),
+            session_ref.clone(),
+            Some(10),
+            Some("startup".into()),
+        );
+        let working = terminal.set_hook_authority_with_session_ref(
+            "herdr:kilo".into(),
+            "kilo".into(),
+            AgentState::Working,
+            None,
+            session_ref,
+            Some(11),
+        );
 
-            assert!(
-                session.is_some(),
-                "{label} should accept its startup session"
-            );
-            assert!(
-                working.is_some(),
-                "{label} should accept state after startup"
-            );
-            assert_eq!(terminal.state, AgentState::Working);
-        }
+        assert!(session.is_some());
+        assert!(working.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
     }
 
     #[test]
@@ -2602,6 +2601,79 @@ mod tests {
         assert!(mutation.is_none());
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn processless_kimi_lifecycle_requires_exact_identity_session_binding() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("kimi-session").unwrap();
+
+        let identity = terminal.set_agent_session_ref_for_session_start(
+            "herdr:kimi".into(),
+            "kimi".into(),
+            Some(session_ref.clone()),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(identity.is_some());
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.source.as_str(), &session.session_ref)),
+            Some(("herdr:kimi", &session_ref))
+        );
+
+        let missing = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-kimi".into(),
+            "kimi".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(11),
+        );
+        let mismatched = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-kimi".into(),
+            "kimi".into(),
+            AgentState::Blocked,
+            None,
+            crate::agent_resume::AgentSessionRef::id("spoofed-session"),
+            Some(12),
+        );
+        let wrong_agent = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-kimi".into(),
+            "codex".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref.clone()),
+            Some(13),
+        );
+        assert!(missing.is_none());
+        assert!(mismatched.is_none());
+        assert!(wrong_agent.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
+
+        let matching = terminal.set_hook_authority_with_session_ref(
+            "herdr:k8s-kimi".into(),
+            "kimi".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref.clone()),
+            Some(14),
+        );
+        assert!(matching.is_some());
+        assert!(terminal.processless_full_lifecycle_hook_authority_active());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(
+            terminal.hook_authority.as_ref().map(|authority| (
+                authority.source.as_str(),
+                authority.agent_label.as_str(),
+                authority.session_ref.as_ref()
+            )),
+            Some(("herdr:k8s-kimi", "kimi", Some(&session_ref)))
+        );
     }
 
     #[test]
@@ -3862,19 +3934,20 @@ mod tests {
         let now = Instant::now();
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Kimi), AgentState::Idle);
+        let session_ref = crate::agent_resume::AgentSessionRef::id("kimi-root").unwrap();
         anchor_full_lifecycle_session(
             &mut terminal,
             Agent::Kimi,
-            "herdr:kimi",
+            "herdr:k8s-kimi",
             "kimi",
-            crate::agent_resume::AgentSessionRef::id("kimi-root").unwrap(),
+            session_ref.clone(),
         );
         terminal.set_hook_authority_at(
-            "herdr:kimi".into(),
+            "herdr:k8s-kimi".into(),
             "kimi".into(),
             AgentState::Idle,
             None,
-            None,
+            Some(session_ref),
             None,
             now,
         );
@@ -5848,12 +5921,12 @@ mod tests {
         anchor_full_lifecycle_session(
             &mut terminal,
             Agent::Kimi,
-            "herdr:kimi",
+            "herdr:k8s-kimi",
             "kimi",
             crate::agent_resume::AgentSessionRef::id("kimi-session").unwrap(),
         );
         terminal.set_hook_authority_with_session_ref(
-            "herdr:kimi".into(),
+            "herdr:k8s-kimi".into(),
             "kimi".into(),
             AgentState::Working,
             None,

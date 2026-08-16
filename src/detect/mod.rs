@@ -295,18 +295,20 @@ pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> 
                 | ("herdr:mastracode", "mastracode")
                 | ("herdr:opencode", "opencode")
                 | ("herdr:kilo", "kilo")
-                | ("herdr:kimi", "kimi")
         )
 }
 
 pub(crate) fn processless_full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
-    matches!((source, agent_label), ("herdr:k8s-codex", "codex"))
+    matches!(
+        (source, agent_label),
+        ("herdr:k8s-codex", "codex") | ("herdr:k8s-kimi", "kimi")
+    )
 }
 
 pub(crate) fn session_identity_only_integration(source: &str, agent_label: &str) -> bool {
     matches!(
         (source, agent_label),
-        ("herdr:hermes", "hermes") | ("herdr:antigravity_cli", "agy")
+        ("herdr:hermes", "hermes") | ("herdr:antigravity_cli", "agy") | ("herdr:kimi", "kimi")
     )
 }
 
@@ -808,16 +810,29 @@ mod tests {
     }
 
     #[test]
-    fn k8s_codex_is_processless_hook_authority() {
-        assert!(processless_full_lifecycle_hook_authority(
-            "herdr:k8s-codex",
-            "codex"
-        ));
-        assert!(full_lifecycle_hook_authority("herdr:k8s-codex", "codex"));
+    fn k8s_agent_sources_are_strict_processless_hook_authorities() {
+        for (source, agent) in [("herdr:k8s-codex", "codex"), ("herdr:k8s-kimi", "kimi")] {
+            assert!(processless_full_lifecycle_hook_authority(source, agent));
+            assert!(full_lifecycle_hook_authority(source, agent));
+        }
         assert!(!processless_full_lifecycle_hook_authority(
             "herdr:codex",
             "codex"
         ));
+        assert!(!processless_full_lifecycle_hook_authority(
+            "herdr:kimi",
+            "kimi"
+        ));
+        assert!(!processless_full_lifecycle_hook_authority(
+            "herdr:k8s-kimi",
+            "codex"
+        ));
+        assert!(!processless_full_lifecycle_hook_authority(
+            "herdr:k8s-codex",
+            "kimi"
+        ));
+        assert!(session_identity_only_integration("herdr:kimi", "kimi"));
+        assert!(!full_lifecycle_hook_authority("herdr:kimi", "kimi"));
     }
 
     #[test]

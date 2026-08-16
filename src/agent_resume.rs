@@ -138,7 +138,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:droid", "droid", AgentSessionRefKind::Id) => {
             vec!["droid".into(), "--resume".into(), session_ref.value.clone()]
         }
-        ("herdr:kimi", "kimi", AgentSessionRefKind::Id) => {
+        ("herdr:kimi" | "herdr:k8s-kimi", "kimi", AgentSessionRefKind::Id) => {
             vec!["kimi".into(), "--session".into(), session_ref.value.clone()]
         }
         ("herdr:mastracode", "mastracode", AgentSessionRefKind::Id) => {
@@ -229,6 +229,7 @@ pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
             | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
             | ("herdr:kimi", "kimi")
+            | ("herdr:k8s-kimi", "kimi")
             | ("herdr:omp", "omp")
             | ("herdr:mastracode", "mastracode")
             | ("herdr:pi", "pi")
@@ -344,6 +345,16 @@ mod tests {
         assert_eq!(
             plan(
                 "herdr:kimi",
+                "kimi",
+                &AgentSessionRef::id("kimi-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["kimi", "--session", "kimi-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:k8s-kimi",
                 "kimi",
                 &AgentSessionRef::id("kimi-session").unwrap()
             )
@@ -564,6 +575,18 @@ mod tests {
             session_ref_from_report("herdr:kimi", "kimi", Some("kimi-id".into()), None).unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "kimi-id");
+        let session_ref =
+            session_ref_from_report("herdr:k8s-kimi", "kimi", Some("kimi-id".into()), None)
+                .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "kimi-id");
+        assert!(session_ref_from_report(
+            "herdr:k8s-kimi",
+            "codex",
+            Some("spoofed-id".into()),
+            None,
+        )
+        .is_none());
 
         let session_ref = session_ref_from_report(
             "herdr:mastracode",
